@@ -85,9 +85,10 @@ pub fn main() !void {
     defer alloc.free(t.stage3);
 
     var buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buf);
-    try t.writeZig(&stdout.interface);
-    try stdout.end();
+    var stdout_writer = std.fs.File.stdout().writer(&buf);
+    const stdout = &stdout_writer.interface;
+    try t.writeZig(stdout);
+    try stdout.flush();
 
     // Uncomment when manually debugging to see our table sizes.
     // std.log.warn("stage1={} stage2={} stage3={}", .{
