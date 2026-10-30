@@ -144,10 +144,12 @@ const ranges: []const Range = ranges: {
     break :ranges &fixed;
 };
 
-fn getDrawFn(cp: u32) ?*const DrawFn {
+/// Returns the function that draws `cp`, or null if the sprite font
+/// doesn't cover it.
+pub fn getDrawFn(cp: u32) ?*const DrawFn {
     // For special sprites (cursors, underlines, etc.) all sprites are drawn
     // by functions from `Special` that share the name of the enum field.
-    if (cp >= Sprite.start) switch (@as(Sprite, @fromBackingInt(cp))) {
+    if (cp >= Sprite.start) switch (std.enums.fromInt(Sprite, cp) orelse return null) {
         inline else => |sprite| {
             return @field(special, @tagName(sprite));
         },

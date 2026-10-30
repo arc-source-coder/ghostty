@@ -160,9 +160,9 @@ pub const Canvas = struct {
         return region;
     }
 
-    // Adjust clip boundaries to trim off any fully transparent rows or columns.
-    // This circumvents abstractions from z2d so that it can be performant.
-    fn trim(self: *Canvas) void {
+    /// Adjust clip boundaries to trim off any fully transparent rows or columns.
+    /// This circumvents abstractions from z2d so that it can be performant.
+    pub fn trim(self: *Canvas) void {
         const width: u32 = @intCast(self.sfc.getWidth());
         const height: u32 = @intCast(self.sfc.getHeight());
 
