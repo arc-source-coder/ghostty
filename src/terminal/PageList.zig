@@ -17558,11 +17558,11 @@ test "PageList resize reflow exceeds style memory forcing capacity increase" {
             const id = page.styles.add(
                 page.memory,
                 .{
-                    .bg_color = .{ .rgb = .{
+                    .bg_color = .rgb(.{
                         .r = @truncate(x),
                         .g = @truncate(x >> 8),
                         .b = @truncate(x >> 16),
-                    } },
+                    }),
                 },
             ) catch break;
 
@@ -17585,11 +17585,11 @@ test "PageList resize reflow exceeds style memory forcing capacity increase" {
             const id = page.styles.add(
                 page.memory,
                 .{
-                    .fg_color = .{ .rgb = .{
+                    .fg_color = .rgb(.{
                         .r = @truncate(x),
                         .g = @truncate(x >> 8),
                         .b = @truncate(x >> 16),
-                    } },
+                    }),
                 },
             ) catch break;
 
@@ -19950,11 +19950,11 @@ test "PageList grow carries used capacity to the next page" {
     const page = node.page();
     for (0..page.styles.layout.cap / 2) |i| {
         _ = try page.styles.add(page.memory, .{
-            .bg_color = .{ .rgb = .{
+            .bg_color = .rgb(.{
                 .r = @truncate(i),
                 .g = @truncate(i >> 8),
                 .b = 0,
-            } },
+            }),
         });
     }
 
@@ -19996,11 +19996,11 @@ test "PageList grow carry-over respects byte limit" {
     const page = node.page();
     for (0..page.styles.layout.cap / 2) |i| {
         _ = try page.styles.add(page.memory, .{
-            .bg_color = .{ .rgb = .{
+            .bg_color = .rgb(.{
                 .r = @truncate(i),
                 .g = @truncate(i >> 8),
                 .b = 0,
-            } },
+            }),
         });
     }
     try testing.expect(s.page_size > s.limits.max(.bytes));

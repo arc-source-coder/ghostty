@@ -1109,7 +1109,7 @@ pub fn cursorDownScroll(self: *Screen) !void {
 
         // Clear the new row so it gets our bg color. We only do this
         // if we have a bg color at all.
-        if (self.cursor.style.bg_color != .none) {
+        if (self.cursor.style.bg_color.tag != .none) {
             const page: *Page = self.cursor.page_pin.node.page();
             self.clearCells(
                 page,
@@ -1366,7 +1366,7 @@ pub fn cursorScrollRegionUp(self: *Screen, limit: usize) !void {
         // Whether our blank cell is a plain zero cell. This is true
         // unless the cursor has a background color set (see blankCell).
         const blank_is_zero = self.cursor.style_id == style.default_id or
-            self.cursor.style.bg_color == .none;
+            self.cursor.style.bg_color.tag == .none;
 
         if (!row.managedMemory() and blank_is_zero) {
             // Hot path: the row has no managed memory (styles,
@@ -2489,15 +2489,11 @@ pub fn setAttribute(
         },
 
         .underline_color => |rgb| {
-            self.cursor.style.underline_color = .{ .rgb = .{
-                .r = rgb.r,
-                .g = rgb.g,
-                .b = rgb.b,
-            } };
+            self.cursor.style.underline_color = .rgb(.{ .r = rgb.r, .g = rgb.g, .b = rgb.b });
         },
 
         .@"256_underline_color" => |idx| {
-            self.cursor.style.underline_color = .{ .palette = idx };
+            self.cursor.style.underline_color = .palette(idx);
         },
 
         .reset_underline_color => {
@@ -2545,31 +2541,19 @@ pub fn setAttribute(
         },
 
         .direct_color_fg => |rgb| {
-            self.cursor.style.fg_color = .{
-                .rgb = .{
-                    .r = rgb.r,
-                    .g = rgb.g,
-                    .b = rgb.b,
-                },
-            };
+            self.cursor.style.fg_color = .rgb(.{ .r = rgb.r, .g = rgb.g, .b = rgb.b });
         },
 
         .direct_color_bg => |rgb| {
-            self.cursor.style.bg_color = .{
-                .rgb = .{
-                    .r = rgb.r,
-                    .g = rgb.g,
-                    .b = rgb.b,
-                },
-            };
+            self.cursor.style.bg_color = .rgb(.{ .r = rgb.r, .g = rgb.g, .b = rgb.b });
         },
 
         .@"8_fg" => |n| {
-            self.cursor.style.fg_color = .{ .palette = @backingInt(n) };
+            self.cursor.style.fg_color = .palette(@backingInt(n));
         },
 
         .@"8_bg" => |n| {
-            self.cursor.style.bg_color = .{ .palette = @backingInt(n) };
+            self.cursor.style.bg_color = .palette(@backingInt(n));
         },
 
         .reset_fg => self.cursor.style.fg_color = .none,
@@ -2577,19 +2561,19 @@ pub fn setAttribute(
         .reset_bg => self.cursor.style.bg_color = .none,
 
         .@"8_bright_fg" => |n| {
-            self.cursor.style.fg_color = .{ .palette = @backingInt(n) };
+            self.cursor.style.fg_color = .palette(@backingInt(n));
         },
 
         .@"8_bright_bg" => |n| {
-            self.cursor.style.bg_color = .{ .palette = @backingInt(n) };
+            self.cursor.style.bg_color = .palette(@backingInt(n));
         },
 
         .@"256_fg" => |idx| {
-            self.cursor.style.fg_color = .{ .palette = idx };
+            self.cursor.style.fg_color = .palette(idx);
         },
 
         .@"256_bg" => |idx| {
-            self.cursor.style.bg_color = .{ .palette = idx };
+            self.cursor.style.bg_color = .palette(idx);
         },
 
         .unknown => return,
@@ -5108,7 +5092,7 @@ test "Screen: cursorAbsolute to page with insufficient capacity" {
         var n: u24 = 1;
         while (start_page.styles.add(
             start_page.memory,
-            .{ .bg_color = .{ .rgb = @bitCast(n) } },
+            .{ .bg_color = .rgb(@bitCast(n)) },
         )) |_| n += 1 else |_| {}
     }
 
@@ -9330,7 +9314,7 @@ test "Screen: resize more cols with cursor at prompt" {
     defer s.deinit();
 
     // zig fmt: off
-    try s.testWriteString("ABCDE\n"); 
+    try s.testWriteString("ABCDE\n");
     s.cursorSetSemanticContent(.{ .prompt = .initial });
     try s.testWriteString("> ");
     s.cursorSetSemanticContent(.{ .input = .clear_eol });
@@ -9371,7 +9355,7 @@ test "Screen: resize more cols with cursor not at prompt" {
     defer s.deinit();
 
     // zig fmt: off
-    try s.testWriteString("ABCDE\n"); 
+    try s.testWriteString("ABCDE\n");
     s.cursorSetSemanticContent(.{ .prompt = .initial });
     try s.testWriteString("> ");
     s.cursorSetSemanticContent(.{ .input = .clear_eol });
@@ -11968,7 +11952,7 @@ test "Screen: cursorDown to page with insufficient capacity" {
         var n: u24 = 1;
         while (new_page.styles.add(
             new_page.memory,
-            .{ .bg_color = .{ .rgb = @bitCast(n) } },
+            .{ .bg_color = .rgb(@bitCast(n)) },
         )) |_| n += 1 else |_| {}
     }
 
@@ -12036,7 +12020,7 @@ test "Screen setAttribute increases capacity when style map is full" {
         while (n < max_items) : (n += 1) {
             _ = page.styles.add(
                 page.memory,
-                .{ .bg_color = .{ .rgb = @bitCast(@as(u24, @intCast(n))) } },
+                .{ .bg_color = .rgb(@bitCast(@as(u24, @intCast(n)))) },
             ) catch break;
         }
     }
@@ -12102,7 +12086,7 @@ test "Screen setAttribute splits page on OutOfSpace at max styles" {
         while (n < max_items) : (n += 1) {
             _ = page.styles.add(
                 page.memory,
-                .{ .bg_color = .{ .rgb = @bitCast(@as(u24, @intCast(n))) } },
+                .{ .bg_color = .rgb(@bitCast(@as(u24, @intCast(n)))) },
             ) catch break;
         }
     }
