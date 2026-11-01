@@ -2444,10 +2444,22 @@ pub fn setAttribute(
     self: *Screen,
     attr: sgr.Attribute,
 ) PageList.IncreaseCapacityError!void {
+    const old_style = self.cursor.style;
+
+    // Compute the new style before storing it into the cursor. If the
+    // style hasn't changed, we can return without writing it back.
+    const new_style = old_style.withAttribute(attr);
+
+    // If the attribute didn't change our style then we can skip the
+    // style update entirely: our current style ID is already correct.
+    // This is a common case in the wild where programs re-assert the
+    // same style repeatedly (e.g. per span or per line).
+    if (new_style.eql(old_style)) return;
+
     // If we fail to set our style for any reason, we should revert
     // back to the old style. If we fail to do that, we revert back to
     // the default style.
-    const old_style = self.cursor.style;
+    self.cursor.style = new_style;
     errdefer {
         self.cursor.style = old_style;
         self.manualStyleUpdate() catch |err| {
@@ -2456,134 +2468,6 @@ pub fn setAttribute(
             self.manualStyleUpdate() catch unreachable;
         };
     }
-
-    switch (attr) {
-        .unset => {
-            self.cursor.style = .{};
-        },
-
-        .bold => {
-            self.cursor.style.flags.bold = true;
-        },
-
-        .reset_bold => {
-            // Bold and faint share the same SGR code for this
-            self.cursor.style.flags.bold = false;
-            self.cursor.style.flags.faint = false;
-        },
-
-        .italic => {
-            self.cursor.style.flags.italic = true;
-        },
-
-        .reset_italic => {
-            self.cursor.style.flags.italic = false;
-        },
-
-        .faint => {
-            self.cursor.style.flags.faint = true;
-        },
-
-        .underline => |v| {
-            self.cursor.style.flags.underline = v;
-        },
-
-        .underline_color => |rgb| {
-            self.cursor.style.underline_color = .rgb(.{ .r = rgb.r, .g = rgb.g, .b = rgb.b });
-        },
-
-        .@"256_underline_color" => |idx| {
-            self.cursor.style.underline_color = .palette(idx);
-        },
-
-        .reset_underline_color => {
-            self.cursor.style.underline_color = .none;
-        },
-
-        .overline => {
-            self.cursor.style.flags.overline = true;
-        },
-
-        .reset_overline => {
-            self.cursor.style.flags.overline = false;
-        },
-
-        .blink => {
-            self.cursor.style.flags.blink = true;
-        },
-
-        .reset_blink => {
-            self.cursor.style.flags.blink = false;
-        },
-
-        .inverse => {
-            self.cursor.style.flags.inverse = true;
-        },
-
-        .reset_inverse => {
-            self.cursor.style.flags.inverse = false;
-        },
-
-        .invisible => {
-            self.cursor.style.flags.invisible = true;
-        },
-
-        .reset_invisible => {
-            self.cursor.style.flags.invisible = false;
-        },
-
-        .strikethrough => {
-            self.cursor.style.flags.strikethrough = true;
-        },
-
-        .reset_strikethrough => {
-            self.cursor.style.flags.strikethrough = false;
-        },
-
-        .direct_color_fg => |rgb| {
-            self.cursor.style.fg_color = .rgb(.{ .r = rgb.r, .g = rgb.g, .b = rgb.b });
-        },
-
-        .direct_color_bg => |rgb| {
-            self.cursor.style.bg_color = .rgb(.{ .r = rgb.r, .g = rgb.g, .b = rgb.b });
-        },
-
-        .@"8_fg" => |n| {
-            self.cursor.style.fg_color = .palette(@backingInt(n));
-        },
-
-        .@"8_bg" => |n| {
-            self.cursor.style.bg_color = .palette(@backingInt(n));
-        },
-
-        .reset_fg => self.cursor.style.fg_color = .none,
-
-        .reset_bg => self.cursor.style.bg_color = .none,
-
-        .@"8_bright_fg" => |n| {
-            self.cursor.style.fg_color = .palette(@backingInt(n));
-        },
-
-        .@"8_bright_bg" => |n| {
-            self.cursor.style.bg_color = .palette(@backingInt(n));
-        },
-
-        .@"256_fg" => |idx| {
-            self.cursor.style.fg_color = .palette(idx);
-        },
-
-        .@"256_bg" => |idx| {
-            self.cursor.style.bg_color = .palette(idx);
-        },
-
-        .unknown => return,
-    }
-
-    // If the attribute didn't change our style then we can skip the
-    // style update entirely: our current style ID is already correct.
-    // This is a common case in the wild where programs re-assert the
-    // same style repeatedly (e.g. per span or per line).
-    if (self.cursor.style.eql(old_style)) return;
 
     try self.manualStyleUpdate();
 }
