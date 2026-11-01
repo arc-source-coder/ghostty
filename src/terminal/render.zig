@@ -2754,11 +2754,20 @@ const RowBuilder = struct {
     ) Allocator.Error!void {
         const cells_grapheme = cells_slice.items(.grapheme);
         const n = page_cells.len;
-        const runs_start = b.pending_styles.items.len;
 
         // Each cell starts at most one style run, so reserve a row's worth
         // up front to keep the appends below allocation-free.
         try b.pending_styles.ensureUnusedCapacity(b.alloc, n);
+
+        // Write runs through a local slice and count, and copy the page
+        // fields we read. Locals can't alias the run stores, so the loop
+        // doesn't reload them after every run. The defer keeps the runs
+        // written before an error, as append did.
+        const runs = b.pending_styles.unusedCapacitySlice();
+        var runs_len: usize = 0;
+        defer b.pending_styles.items.len += runs_len;
+        const memory = p.memory;
+        const styles = p.styles;
         var x: usize = 0;
         scan: while (x < n) {
             // Skip runs of plain cells a group at a time. Cells that
@@ -2798,7 +2807,7 @@ const RowBuilder = struct {
                     @branchHint(.likely);
                     const sid = page_cell.style_id;
                     assert(sid > 0); // special + codepoint implies styled
-                    const style_val: Style = p.styles.get(p.memory, sid).*;
+                    const style_val: Style = styles.get(memory, sid).*;
 
                     // A cell continues the run if its masked special
                     // bits are exactly the style ID of the run (in
@@ -2823,12 +2832,13 @@ const RowBuilder = struct {
                         )) break;
                     }
 
-                    b.pending_styles.appendAssumeCapacity(.{
+                    runs[runs_len] = .{
                         .y = @intCast(vy),
                         .start = @intCast(start),
                         .end = @intCast(x),
                         .style = style_val,
-                    });
+                    };
+                    runs_len += 1;
 
                     // A placeholder can leave out its row and column
                     // (it then continues the run to its left), which
@@ -2847,16 +2857,17 @@ const RowBuilder = struct {
                 // relative to possibly-stale runs from prior updates.
                 .codepoint_grapheme => {
                     const style_val: Style = if (page_cell.style_id > 0) style: {
-                        const style_val = p.styles.get(
-                            p.memory,
+                        const style_val = styles.get(
+                            memory,
                             page_cell.style_id,
                         ).*;
-                        b.pending_styles.appendAssumeCapacity(.{
+                        runs[runs_len] = .{
                             .y = @intCast(vy),
                             .start = @intCast(x),
                             .end = @intCast(x + 1),
                             .style = style_val,
-                        });
+                        };
+                        runs_len += 1;
                         break :style style_val;
                     } else .{};
                     const cps = try arena_alloc.dupe(
@@ -2911,12 +2922,13 @@ const RowBuilder = struct {
                             break;
                     }
 
-                    b.pending_styles.appendAssumeCapacity(.{
+                    runs[runs_len] = .{
                         .y = @intCast(vy),
                         .start = @intCast(start),
                         .end = @intCast(x),
                         .style = style_val,
-                    });
+                    };
+                    runs_len += 1;
                 },
             }
         }
@@ -2924,10 +2936,9 @@ const RowBuilder = struct {
         // Reserve the applied style cache capacity for the runs we
         // appended so that endUpdate (which cannot allocate) is able
         // to record what it applies. See Row.applied_styles.
-        const runs_added = b.pending_styles.items.len - runs_start;
-        if (runs_added > 0) try b.applied_styles[vy].ensureTotalCapacity(
+        if (runs_len > 0) try b.applied_styles[vy].ensureTotalCapacity(
             b.alloc,
-            runs_added,
+            runs_len,
         );
     }
 };
