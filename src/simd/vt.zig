@@ -9,44 +9,57 @@ extern "c" fn ghostty_simd_decode_utf8_until_control_seq(
     count: usize,
     output: [*]u32,
     output_count: *usize,
-    ascii: *bool,
 ) usize;
 
 const DecodeResult = struct {
     consumed: usize,
     decoded: usize,
-
-    /// Every consumed byte is ASCII (printable or a C0 control), so the
-    /// decoded codepoints are just those bytes, `decoded == consumed`,
-    /// and output may not have been written: read the input instead.
-    /// When false, output holds the decoded codepoints.
-    ascii: bool,
 };
 
-/// Decode UTF-8 from input into output until an ESC. ASCII needs no
-/// decoding, so for ASCII input the caller reads the input bytes rather
-/// than output (see DecodeResult).
+/// Decode UTF-8 from input into output until an ESC.
 pub fn utf8DecodeUntilControlSeq(
     input: []const u8,
     output: []u32,
 ) DecodeResult {
     assert(output.len >= input.len);
 
-    if (comptime options.simd) {
-        var decoded: usize = 0;
-        var ascii: bool = false;
-        const consumed = ghostty_simd_decode_utf8_until_control_seq(
-            input.ptr,
-            input.len,
-            output.ptr,
-            &decoded,
-            &ascii,
-        );
+    if (comptime !options.simd) return utf8DecodeUntilControlSeqScalar(input, output);
 
-        return .{ .consumed = consumed, .decoded = decoded, .ascii = ascii };
+    // Runs between escape sequences are often a few bytes, like a single
+    // glyph between two SGR sequences. vt.cpp would pay a Highway
+    // dispatch to find their ESC, and simdutf its own dispatch and a
+    // virtual call, only to decode them with scalar code anyway: simdutf
+    // decodes a 64-byte block with SIMD only while a margin covering the
+    // last few characters follows it, 16 bytes for two-byte text. So
+    // decode runs that end within that many bytes here.
+    //
+    // One compare of all those bytes finds whether the ESC is among
+    // them. It doesn't stop early at an ESC in the first few bytes like
+    // std.mem.indexOfScalar, but it doesn't loop or finish a byte at a
+    // time either, which costs long runs more.
+    const short_len = 80;
+    if (input.len <= short_len) return utf8DecodeUntilControlSeqScalar(input, output);
+    const V = @Vector(short_len, u8);
+    const short: V = input[0..short_len].*;
+    if (@reduce(.Or, short == @as(V, @splat(0x1B)))) {
+        return utf8DecodeUntilControlSeqScalar(input, output);
     }
 
-    return utf8DecodeUntilControlSeqScalar(input, output);
+    return utf8DecodeUntilControlSeqSimd(input, output);
+}
+
+fn utf8DecodeUntilControlSeqSimd(
+    input: []const u8,
+    output: []u32,
+) DecodeResult {
+    var decoded: usize = 0;
+    const consumed = ghostty_simd_decode_utf8_until_control_seq(
+        input.ptr,
+        input.len,
+        output.ptr,
+        &decoded,
+    );
+    return .{ .consumed = consumed, .decoded = decoded };
 }
 
 fn utf8DecodeUntilControlSeqScalar(
@@ -58,7 +71,6 @@ fn utf8DecodeUntilControlSeqScalar(
     // for ill-formed subsequences.
     var i: usize = 0;
     var count: usize = 0;
-    var ascii = true;
     while (i < input.len) {
         const b0 = input[i];
         if (b0 < 0x80) {
@@ -93,8 +105,6 @@ fn utf8DecodeUntilControlSeqScalar(
             i += 1;
             continue;
         }
-
-        ascii = false;
 
         // Fast path for a complete, well-formed sequence: assemble the
         // codepoint from the payload bits of each byte, then check that
@@ -165,7 +175,6 @@ fn utf8DecodeUntilControlSeqScalar(
             if (valid == rest.len) return .{
                 .consumed = i,
                 .decoded = count,
-                .ascii = false,
             };
             const lo: u8 = if (valid == 1) cb1_lo else 0x80;
             const hi: u8 = if (valid == 1) cb1_hi else 0xBF;
@@ -179,7 +188,6 @@ fn utf8DecodeUntilControlSeqScalar(
     return .{
         .consumed = i,
         .decoded = count,
-        .ascii = ascii,
     };
 }
 
@@ -229,21 +237,24 @@ test "decode simd matches scalar" {
             };
         }
 
-        const res_simd = utf8DecodeUntilControlSeq(input[0..len], &out_simd);
-        const res_scalar = utf8DecodeUntilControlSeqScalar(input[0..len], &out_scalar);
         errdefer std.debug.print("input={x}\n", .{input[0..len]});
-        try testing.expectEqual(res_scalar.consumed, res_simd.consumed);
-        try testing.expectEqual(res_scalar.decoded, res_simd.decoded);
-        try testing.expectEqual(res_scalar.ascii, res_simd.ascii);
-        if (res_simd.ascii) {
-            for (input[0..res_simd.consumed], out_scalar[0..res_scalar.decoded]) |b, cp| {
-                try testing.expectEqual(@as(u32, b), cp);
-            }
-        } else try testing.expectEqualSlices(
-            u32,
-            out_scalar[0..res_scalar.decoded],
-            out_simd[0..res_simd.decoded],
-        );
+        const res_scalar = utf8DecodeUntilControlSeqScalar(input[0..len], &out_scalar);
+
+        // Both vt.cpp alone, which decodes only long runs otherwise, and
+        // the decoder that picks one of the two by the length of the run.
+        for ([_]*const fn ([]const u8, []u32) DecodeResult{
+            utf8DecodeUntilControlSeqSimd,
+            utf8DecodeUntilControlSeq,
+        }) |decode| {
+            const res_simd = decode(input[0..len], &out_simd);
+            try testing.expectEqual(res_scalar.consumed, res_simd.consumed);
+            try testing.expectEqual(res_scalar.decoded, res_simd.decoded);
+            try testing.expectEqualSlices(
+                u32,
+                out_scalar[0..res_scalar.decoded],
+                out_simd[0..res_simd.decoded],
+            );
+        }
     }
 }
 
@@ -258,7 +269,6 @@ test "decode no escape" {
         try testing.expectEqual(DecodeResult{
             .consumed = str.len,
             .decoded = str.len,
-            .ascii = true,
         }, utf8DecodeUntilControlSeq(&str, &output));
     }
 }
@@ -276,7 +286,6 @@ test "decode ASCII to escape" {
         try testing.expectEqual(DecodeResult{
             .consumed = prefix.len,
             .decoded = prefix.len,
-            .ascii = true,
         }, utf8DecodeUntilControlSeq(str, &output));
     }
 }
@@ -301,7 +310,6 @@ test "decode ASCII ends at ESC and non-ASCII" {
         try testing.expectEqual(DecodeResult{
             .consumed = offset,
             .decoded = offset,
-            .ascii = true,
         }, utf8DecodeUntilControlSeq(&input, &output));
 
         // A lone continuation byte decodes to U+FFFD, and the ASCII
@@ -312,7 +320,6 @@ test "decode ASCII ends at ESC and non-ASCII" {
         try testing.expectEqual(DecodeResult{
             .consumed = end,
             .decoded = end,
-            .ascii = false,
         }, res);
         for (input[0..end], output[0..end], 0..) |b, cp, i| {
             try testing.expectEqual(if (i == offset) 0xFFFD else @as(u32, b), cp);
@@ -328,7 +335,6 @@ test "decode immediate esc sequence" {
     try testing.expectEqual(DecodeResult{
         .consumed = 0,
         .decoded = 0,
-        .ascii = true,
     }, utf8DecodeUntilControlSeq(str, &output));
 }
 
@@ -343,7 +349,6 @@ test "decode incomplete UTF-8" {
         try testing.expectEqual(DecodeResult{
             .consumed = 5,
             .decoded = 5,
-            .ascii = false,
         }, utf8DecodeUntilControlSeq(str, &output));
     }
 
@@ -364,7 +369,6 @@ test "decode incomplete UTF-8" {
         try testing.expectEqual(DecodeResult{
             .consumed = 5,
             .decoded = 5,
-            .ascii = false,
         }, utf8DecodeUntilControlSeq(str, &output));
     }
 }
@@ -380,7 +384,6 @@ test "decode invalid UTF-8" {
         try testing.expectEqual(DecodeResult{
             .consumed = 7,
             .decoded = 7,
-            .ascii = false,
         }, utf8DecodeUntilControlSeq(str, &output));
     }
 

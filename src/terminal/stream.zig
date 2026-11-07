@@ -900,28 +900,29 @@ pub fn Stream(comptime H: type) type {
             // input until we see an ESC (0x1B), since all other characters
             // up to that point are just UTF-8.
             while (self.parser.state == .ground and offset < input.len) {
-                const res = simd.vt.utf8DecodeUntilControlSeq(input[offset..], cp_buf);
-
-                // ASCII needs no decoding, so the decoder leaves it in
-                // the input and we split it into runs there.
-                if (res.ascii) {
-                    self.printRuns(u8, input[offset..][0..res.consumed], cp_buf);
-                } else {
-                    self.printRuns(u32, cp_buf[0..res.decoded], cp_buf);
-                }
-
-                // Consume the bytes we just processed.
-                offset += res.consumed;
-
+                // ASCII needs no decoding, so print it straight from the
+                // input. This stops at an ESC or a non-ASCII byte.
+                offset += self.printRuns(u8, input[offset..], cp_buf);
                 if (offset >= input.len) return;
 
-                // If our offset is NOT an escape then we must have a
-                // partial UTF-8 sequence. In that case, we pass it off
-                // to the scalar parser.
+                // Decode non-ASCII up to the next ESC.
                 if (input[offset] != 0x1B) {
-                    const rem = input[offset..];
-                    for (rem) |c| self.nextUtf8(c);
-                    return;
+                    const res = simd.vt.utf8DecodeUntilControlSeq(input[offset..], cp_buf);
+                    _ = self.printRuns(u32, cp_buf[0..res.decoded], cp_buf);
+
+                    // Consume the bytes we just processed.
+                    offset += res.consumed;
+
+                    if (offset >= input.len) return;
+
+                    // If our offset is NOT an escape then we must have a
+                    // partial UTF-8 sequence. In that case, we pass it off
+                    // to the scalar parser.
+                    if (input[offset] != 0x1B) {
+                        const rem = input[offset..];
+                        for (rem) |c| self.nextUtf8(c);
+                        return;
+                    }
                 }
 
                 // Process control sequences until we run out.
@@ -933,28 +934,35 @@ pub fn Stream(comptime H: type) type {
         /// Hand the runs of printable codepoints in cps to the handler as
         /// print_slice actions, so it can process them with per-run
         /// rather than per-codepoint overhead, and execute the controls
-        /// between them. ASCII comes as bytes (u8), and then every run
-        /// is printable ASCII. `buf` may be overwritten unless it holds
-        /// cps.
+        /// between them. ASCII comes as the input bytes (u8), and this
+        /// stops at the first ESC or non-ASCII byte for the caller to
+        /// handle, or at the start of a short run that ends at one the
+        /// caller decodes with it (see below); decoded codepoints (u32)
+        /// are all consumed. Returns the number consumed. `buf` may be
+        /// overwritten unless it holds cps.
         inline fn printRuns(
             self: *Self,
             comptime Cp: type,
             cps: []const Cp,
             buf: []u32,
-        ) void {
+        ) usize {
             const ascii = Cp == u8;
             var i: usize = 0;
             while (i < cps.len) {
                 const cp = cps[i];
-                // C0 and UTF-8-decoded C1 controls never enter
-                // printable runs. A codepoint is one of those
-                // exactly when it has no bit set outside 0x9F:
-                // bits 0-4 and bit 7 cover 0x00-0x1F and
-                // 0x80-0x9F and nothing else, so a single
-                // AND-test classifies both ranges. ASCII has no C1.
-                const control = if (ascii) cp < 0x20 else (cp & ~@as(u32, 0x9F)) == 0;
-                if (control) {
+                // Whether cp stops a printable run. C0 and UTF-8-decoded
+                // C1 controls never enter printable runs, nor do bytes
+                // that aren't ASCII. A codepoint is a control exactly
+                // when it has no bit set outside 0x9F: bits 0-4 and bit
+                // 7 cover 0x00-0x1F and 0x80-0x9F and nothing else, so a
+                // single AND-test classifies both ranges. Bytes print
+                // from 0x20 to 0x7F, so one wrapping subtract classifies
+                // C0 and non-ASCII together.
+                const stop = if (ascii) cp -% 0x20 >= 0x60 else (cp & ~@as(u32, 0x9F)) == 0;
+                if (stop) {
                     @branchHint(.unlikely);
+                    // ESC and non-ASCII bytes are for the caller.
+                    if (ascii and (cp == 0x1B or cp >= 0x80)) return i;
                     if (ascii or cp <= 0x1F) {
                         // C0 controls execute rather than print.
                         self.execute(@intCast(cp));
@@ -982,11 +990,11 @@ pub fn Stream(comptime H: type) type {
                         const V = @Vector(lanes, Cp);
                         while (end + lanes <= cps.len) : (end += lanes) {
                             const v: V = cps[end..][0..lanes].*;
-                            const stop = if (ascii)
-                                v < @as(V, @splat(0x20))
+                            const stops = if (ascii)
+                                v -% @as(V, @splat(0x20)) >= @as(V, @splat(0x60))
                             else
                                 (v & @as(V, @splat(~@as(u32, 0x9F)))) == @as(V, @splat(0));
-                            if (simd.firstTrue(Cp, stop)) |n| {
+                            if (simd.firstTrue(Cp, stops)) |n| {
                                 end += n;
                                 break :scan;
                             }
@@ -994,16 +1002,43 @@ pub fn Stream(comptime H: type) type {
                     }
                     while (end < cps.len) : (end += 1) {
                         const c = cps[end];
-                        if (if (ascii) c < 0x20 else (c & ~@as(u32, 0x9F)) == 0) break;
+                        if (if (ascii) c -% 0x20 >= 0x60 else (c & ~@as(u32, 0x9F)) == 0) break;
                     }
                 }
                 if (ascii) {
+                    if (end == cps.len) {
+                        self.printAscii(cps[i..end], buf);
+                        return end;
+                    }
+
+                    // The byte that ended the run is a control or not
+                    // ASCII. Handle it here rather than classifying it
+                    // again at the top of the loop.
+                    const stopper = cps[end];
+
+                    // A short run that ends at a two-byte UTF-8 sequence
+                    // (U+0080 to U+07FF, e.g. accented Latin) goes to the
+                    // decoder with the text after it, so the handler gets
+                    // one print_slice rather than two. Decoding the run
+                    // again costs a few instructions per byte, and a
+                    // print_slice costs a few hundred, so this only pays
+                    // for short runs. 32 bytes is the break-even measured
+                    // on x86-64.
+                    if (stopper -% 0xC2 < 0x1E and end - i <= 32) return i;
                     self.printAscii(cps[i..end], buf);
-                } else {
-                    self.handler.vt(.print_slice, .{ .cps = cps[i..end] });
+
+                    // ESC and other non-ASCII bytes are for the caller.
+                    if (stopper == 0x1B or stopper >= 0x80) return end;
+
+                    // C0 controls execute rather than print.
+                    self.execute(stopper);
+                    i = end + 1;
+                    continue;
                 }
+                self.handler.vt(.print_slice, .{ .cps = cps[i..end] });
                 i = end;
             }
+            return i;
         }
 
         /// Parses back-to-back escape sequences until none are left.
