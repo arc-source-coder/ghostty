@@ -1039,15 +1039,12 @@ fn printSliceFill(
                 const V = @Vector(lanes, u32);
                 const lo: V = @splat(0x10);
                 const hi: V = @splat(0xFF);
-                while (idx + lanes <= cps.len) {
+                while (idx + lanes <= cps.len) : (idx += lanes) {
                     const v: V = cps[idx..][0..lanes].*;
-                    const in_range = (v >= lo) & (v <= hi);
-                    if (!@reduce(.And, in_range)) {
-                        const bits: @Int(.unsigned, lanes) = @bitCast(in_range);
-                        idx += @ctz(~bits);
+                    if (simd.firstTrue(u32, (v < lo) | (v > hi))) |n| {
+                        idx += n;
                         break;
                     }
-                    idx += lanes;
                 }
             }
         }

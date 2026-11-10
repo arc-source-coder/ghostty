@@ -2,6 +2,7 @@ const std = @import("std");
 const options = @import("build_options");
 const assert = @import("../quirks.zig").inlineAssert;
 const indexOf = @import("index_of.zig").indexOf;
+const firstTrue = @import("main.zig").firstTrue;
 
 // vt.cpp
 extern "c" fn ghostty_simd_decode_utf8_until_control_seq(
@@ -75,11 +76,15 @@ fn utf8DecodeUntilControlSeqScalar(
                 const V = @Vector(vl, u8);
                 while (decode_offset + vl <= decode.len) {
                     const v: V = decode[decode_offset..][0..vl].*;
-                    if (@reduce(.Or, v >= @as(V, @splat(0x80)))) break;
-                    const w: @Vector(vl, u32) = @intCast(v);
-                    output[decode_count..][0..vl].* = w;
-                    decode_count += vl;
-                    decode_offset += vl;
+
+                    // Widen the whole vector but count only the ASCII
+                    // before the first non-ASCII byte. Output has room,
+                    // since every byte decodes to at most one codepoint.
+                    output[decode_count..][0..vl].* = @as(@Vector(vl, u32), v);
+                    const n = firstTrue(u8, v >= @as(V, @splat(0x80))) orelse vl;
+                    decode_count += n;
+                    decode_offset += n;
+                    if (n < vl) break;
                 }
             }
             while (decode_offset < decode.len) {

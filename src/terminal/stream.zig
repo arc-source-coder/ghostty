@@ -980,18 +980,16 @@ pub fn Stream(comptime H: type) type {
                 scan: {
                     if (simd.lanes(Cp)) |lanes| {
                         const V = @Vector(lanes, Cp);
-                        while (end + lanes <= cps.len) {
+                        while (end + lanes <= cps.len) : (end += lanes) {
                             const v: V = cps[end..][0..lanes].*;
                             const stop = if (ascii)
                                 v < @as(V, @splat(0x20))
                             else
                                 (v & @as(V, @splat(~@as(u32, 0x9F)))) == @as(V, @splat(0));
-                            if (@reduce(.Or, stop)) {
-                                const bits: @Int(.unsigned, lanes) = @bitCast(stop);
-                                end += @ctz(bits);
+                            if (simd.firstTrue(Cp, stop)) |n| {
+                                end += n;
                                 break :scan;
                             }
-                            end += lanes;
                         }
                     }
                     while (end < cps.len) : (end += 1) {
@@ -1301,14 +1299,16 @@ pub fn Stream(comptime H: type) type {
             var end: usize = 0;
             if (comptime std.simd.suggestVectorLength(u8)) |vector_len| {
                 const ByteVector = @Vector(vector_len, u8);
-                while (end + vector_len <= input.len) {
+                while (end + vector_len <= input.len) : (end += vector_len) {
                     const bytes: ByteVector = input[end..][0..vector_len].*;
                     const invalid = (bytes == @as(ByteVector, @splat(0x18))) |
                         (bytes == @as(ByteVector, @splat(0x1A))) |
                         (bytes == @as(ByteVector, @splat(0x1B))) |
                         (bytes >= @as(ByteVector, @splat(0x80)));
-                    if (@reduce(.Or, invalid)) break;
-                    end += vector_len;
+                    if (simd.firstTrue(u8, invalid)) |n| {
+                        end += n;
+                        break;
+                    }
                 }
             }
             while (end < input.len) {
@@ -1344,11 +1344,13 @@ pub fn Stream(comptime H: type) type {
             var end: usize = 0;
             if (comptime std.simd.suggestVectorLength(u8)) |vector_len| {
                 const ByteVector = @Vector(vector_len, u8);
-                while (end + vector_len <= input.len) {
+                while (end + vector_len <= input.len) : (end += vector_len) {
                     const bytes: ByteVector = input[end..][0..vector_len].*;
                     const stop = bytes < @as(ByteVector, @splat(0x20));
-                    if (@reduce(.Or, stop)) break;
-                    end += vector_len;
+                    if (simd.firstTrue(u8, stop)) |n| {
+                        end += n;
+                        break;
+                    }
                 }
             }
             while (end < input.len) {
