@@ -7,7 +7,6 @@
 #include <simdutf.h>
 
 #include <simd/index_of.h>
-#include <simd/vt.h>
 
 HWY_BEFORE_NAMESPACE();
 namespace ghostty {

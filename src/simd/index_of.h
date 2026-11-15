@@ -41,60 +41,6 @@ size_t IndexOfChunk(D d,
   }
 }
 
-// Return the index of the first occurrence of `needle` in `input` or
-// `count` if not found.
-template <class D, typename T = hn::TFromD<D>>
-size_t IndexOfImpl(D d, T needle, const T* HWY_RESTRICT input, size_t count) {
-  // Note: due to the simplicity of this operation and the general complexity
-  // of SIMD, I'm going to overly comment this function to help explain the
-  // implementation for future maintainers.
-
-  // The number of lanes in the vector type.
-  const size_t N = hn::Lanes(d);
-
-  // Create a vector with all lanes set to `needle` so we can do a lane-wise
-  // comparison with the input.
-  const hn::Vec<D> needle_vec = Set(d, needle);
-
-  // Compare N elements at a time.
-  size_t i = 0;
-  for (; i + N <= count; i += N) {
-    // Load the N elements from our input into a vector and check the chunk.
-    const hn::Vec<D> input_vec = hn::LoadU(d, input + i);
-    const size_t pos = IndexOfChunk(d, needle_vec, input_vec);
-    if (pos != kNotFound) {
-      return i + pos;
-    }
-  }
-
-  // Since we compare N elements at a time, we may have some elements left
-  // if count modulo N != 0. We need to scan the remaining elements. To
-  // be simple, we search one element at a time.
-  if (i != count) {
-    // Create a new vector with only one relevant lane.
-    const hn::CappedTag<T, 1> d1;
-    using D1 = decltype(d1);
-
-    // Get an equally sized needle vector with only one lane.
-    const hn::Vec<D1> needle1 = Set(d1, hn::GetLane(needle_vec));
-
-    // Go through the remaining elements and do similar logic to
-    // the previous loop to find any matches.
-    for (; i < count; ++i) {
-      const hn::Vec<D1> input_vec = hn::LoadU(d1, input + i);
-      const hn::Mask<D1> eq_mask = hn::Eq(needle1, input_vec);
-      if (hn::AllTrue(d1, eq_mask))
-        return i;
-    }
-  }
-
-  return count;
-}
-
-size_t IndexOf(const uint8_t needle,
-               const uint8_t* HWY_RESTRICT input,
-               size_t count);
-
 }  // namespace HWY_NAMESPACE
 }  // namespace ghostty
 HWY_AFTER_NAMESPACE();
