@@ -1,7 +1,6 @@
 const std = @import("std");
 const options = @import("build_options");
 const assert = @import("../quirks.zig").inlineAssert;
-const indexOf = @import("index_of.zig").indexOf;
 const firstTrue = @import("main.zig").firstTrue;
 
 // vt.cpp
@@ -54,66 +53,103 @@ fn utf8DecodeUntilControlSeqScalar(
     input: []const u8,
     output: []u32,
 ) DecodeResult {
-    // Find our escape
-    const idx = indexOf(input, 0x1B) orelse input.len;
-    const decode = input[0..idx];
-
-    // Go through and decode one item at a time, following the W3C/Unicode
-    // "U+FFFD Substitution of Maximal Subparts" algorithm for ill-formed
-    // subsequences.
-    var decode_offset: usize = 0;
-    var decode_count: usize = 0;
+    // Decode one codepoint at a time until an ESC, following the
+    // W3C/Unicode "U+FFFD Substitution of Maximal Subparts" algorithm
+    // for ill-formed subsequences.
+    var i: usize = 0;
+    var count: usize = 0;
     var ascii = true;
-    while (decode_offset < decode.len) {
-        const b0 = decode[decode_offset];
-
-        // ASCII fast path. Use vectorization if it is available. This
-        // path is only run when simd=false, but that only controls our C++
-        // simd builds. We can still rely on Zig intrinsics for platforms
-        // like wasm32+simd128.
+    while (i < input.len) {
+        const b0 = input[i];
         if (b0 < 0x80) {
-            if (comptime std.simd.suggestVectorLength(u8)) |vl| {
-                const V = @Vector(vl, u8);
-                while (decode_offset + vl <= decode.len) {
-                    const v: V = decode[decode_offset..][0..vl].*;
+            if (b0 == 0x1B) break;
 
-                    // Widen the whole vector but count only the ASCII
-                    // before the first non-ASCII byte. Output has room,
-                    // since every byte decodes to at most one codepoint.
-                    output[decode_count..][0..vl].* = @as(@Vector(vl, u32), v);
-                    const n = firstTrue(u8, v >= @as(V, @splat(0x80))) orelse vl;
-                    decode_count += n;
-                    decode_offset += n;
-                    if (n < vl) break;
+            // Widen ASCII a whole vector at a time, up to the next ESC
+            // or non-ASCII byte. The output past that gets overwritten,
+            // and there is room for it: count <= i and output.len >=
+            // input.len. Zig doesn't vectorize loops, so this has to be
+            // explicit. It also works when simd=false, which only
+            // disables our C++ SIMD code, on targets like wasm32+simd128.
+            if (comptime std.simd.suggestVectorLength(u8)) |vl| if (i + vl <= input.len) {
+                const V = @Vector(vl, u8);
+                while (true) {
+                    const v: V = input[i..][0..vl].*;
+                    output[count..][0..vl].* = @as(@Vector(vl, u32), v);
+                    const stop = (v >= @as(V, @splat(0x80))) | (v == @as(V, @splat(0x1B)));
+                    if (firstTrue(u8, stop)) |n| {
+                        count += n;
+                        i += n;
+                        break;
+                    }
+                    count += vl;
+                    i += vl;
+                    if (i + vl > input.len) break;
                 }
-            }
-            while (decode_offset < decode.len) {
-                const b = decode[decode_offset];
-                if (b >= 0x80) break;
-                output[decode_count] = b;
-                decode_count += 1;
-                decode_offset += 1;
-            }
+                continue;
+            };
+
+            output[count] = b0;
+            count += 1;
+            i += 1;
             continue;
         }
 
         ascii = false;
 
-        // Continuation byte (80-BF) or invalid byte (C0-C1, F5-FF)
-        // as lead: each is its own maximal subpart → one FFFD per byte.
+        // Fast path for a complete, well-formed sequence: assemble the
+        // codepoint from the payload bits of each byte, then check that
+        // every continuation byte is 80-BF and that the codepoint is
+        // neither overlong, a surrogate, nor above U+10FFFF, which
+        // together are equivalent to the byte ranges of Unicode
+        // Table 3-7.
+        const rest = input[i..];
+        if (b0 >= 0xC2 and b0 < 0xE0 and rest.len >= 2) {
+            const c1 = rest[1] ^ 0x80;
+            if (c1 < 0x40) {
+                output[count] = @as(u32, b0 & 0x1F) << 6 | c1;
+                count += 1;
+                i += 2;
+                continue;
+            }
+        } else if (b0 >= 0xE0 and b0 < 0xF0 and rest.len >= 3) {
+            const c1 = rest[1] ^ 0x80;
+            const c2 = rest[2] ^ 0x80;
+            const cp = @as(u32, b0 & 0x0F) << 12 | @as(u32, c1) << 6 | c2;
+            if (c1 | c2 < 0x40 and cp >= 0x800 and cp & 0xF800 != 0xD800) {
+                output[count] = cp;
+                count += 1;
+                i += 3;
+                continue;
+            }
+        } else if (b0 >= 0xF0 and b0 < 0xF5 and rest.len >= 4) {
+            const c1 = rest[1] ^ 0x80;
+            const c2 = rest[2] ^ 0x80;
+            const c3 = rest[3] ^ 0x80;
+            const cp = @as(u32, b0 & 0x07) << 18 | @as(u32, c1) << 12 |
+                @as(u32, c2) << 6 | c3;
+            if (c1 | c2 | c3 < 0x40 and cp >= 0x10000 and cp <= 0x10FFFF) {
+                output[count] = cp;
+                count += 1;
+                i += 4;
+                continue;
+            }
+        }
+
+        // Otherwise the sequence is ill-formed or cut off by the end of
+        // the input. A continuation byte (80-BF) or an invalid byte
+        // (C0-C1, F5-FF) as lead is its own maximal subpart: one FFFD.
         if (b0 < 0xC2 or b0 > 0xF4) {
-            output[decode_count] = 0xFFFD;
-            decode_count += 1;
-            decode_offset += 1;
+            output[count] = 0xFFFD;
+            count += 1;
+            i += 1;
             continue;
         }
 
-        // Multi-byte sequence. Only the first continuation byte has a
-        // lead-dependent valid range per Unicode Table 3-7; later
-        // continuation bytes are always 80-BF. Range validity per
-        // Table 3-7 excludes overlong, surrogate, and out-of-range
-        // encodings, so a fully valid sequence can be decoded by
-        // direct bit assembly with no further checks.
+        // Count the continuation bytes that form a valid prefix (the
+        // maximal subpart). Only the first has a lead-dependent range
+        // per Table 3-7; later ones are always 80-BF. An ESC is never in
+        // range, so a sequence cut off by an ESC can never be completed
+        // and its maximal subpart maps to a single FFFD.
         const seq_len: usize = if (b0 < 0xE0) 2 else if (b0 < 0xF0) 3 else 4;
         const cb1_lo: u8, const cb1_hi: u8 = switch (b0) {
             0xE0 => .{ 0xA0, 0xBF },
@@ -122,52 +158,27 @@ fn utf8DecodeUntilControlSeqScalar(
             0xF4 => .{ 0x80, 0x8F },
             else => .{ 0x80, 0xBF },
         };
-
-        // Check how many continuation bytes form a valid prefix (the
-        // maximal subpart), accumulating codepoint bits as we go. The
-        // lead byte contributes its low 7-len bits.
-        var cp: u32 = b0 & (@as(u32, 0x7F) >> @intCast(seq_len));
-        var valid: usize = 1; // lead byte is valid
-        while (valid < seq_len) {
-            if (decode_offset + valid >= decode.len) {
-                // The sequence is cut off by the end of the decode
-                // region. If the region ends at the true end of the
-                // input then it may be completed by future input, so
-                // stop without consuming these bytes. If the region
-                // was bounded by an ESC then the sequence can never
-                // be completed; the valid-so-far prefix is a maximal
-                // subpart which maps to a single U+FFFD below.
-                if (decode.len == input.len) return .{
-                    .consumed = decode_offset,
-                    .decoded = decode_count,
-                    .ascii = false,
-                };
-                break;
-            }
-            const cb = decode[decode_offset + valid];
+        var valid: usize = 1;
+        while (valid < seq_len) : (valid += 1) {
+            // A sequence cut off by the end of the input may be completed
+            // by future input, so stop without consuming it.
+            if (valid == rest.len) return .{
+                .consumed = i,
+                .decoded = count,
+                .ascii = false,
+            };
             const lo: u8 = if (valid == 1) cb1_lo else 0x80;
             const hi: u8 = if (valid == 1) cb1_hi else 0xBF;
-            if (cb < lo or cb > hi) break;
-            cp = (cp << 6) | (cb & 0x3F);
-            valid += 1;
+            if (rest[valid] < lo or rest[valid] > hi) break;
         }
-
-        if (valid == seq_len) {
-            output[decode_count] = cp;
-            decode_count += 1;
-            decode_offset += seq_len;
-        } else {
-            // Incomplete/ill-formed: the maximal subpart (valid bytes)
-            // maps to a single FFFD.
-            output[decode_count] = 0xFFFD;
-            decode_count += 1;
-            decode_offset += valid;
-        }
+        output[count] = 0xFFFD;
+        count += 1;
+        i += valid;
     }
 
     return .{
-        .consumed = decode_offset,
-        .decoded = decode_count,
+        .consumed = i,
+        .decoded = count,
         .ascii = ascii,
     };
 }
@@ -183,13 +194,17 @@ test "decode simd matches scalar" {
     var prng = std.Random.DefaultPrng.init(0xf00dface);
     const rand = prng.random();
 
+    const edges = [_]u8{
+        0x1B, 0x41, 0x7F, 0x80, 0x8F, 0x90, 0x9F, 0xA0, 0xBF, 0xC0, 0xC1, 0xC2, 0xDF,
+        0xE0, 0xE1, 0xEC, 0xED, 0xEE, 0xEF, 0xF0, 0xF1, 0xF3, 0xF4, 0xF5, 0xFF,
+    };
     var input: [257]u8 = undefined;
     var out_simd: [input.len]u32 = undefined;
     var out_scalar: [input.len]u32 = undefined;
 
     for (0..10_000) |_| {
         const len = rand.intRangeAtMost(usize, 0, input.len);
-        const style = rand.intRangeAtMost(u8, 0, 2);
+        const style = rand.intRangeAtMost(u8, 0, 3);
         for (input[0..len]) |*b| {
             b.* = switch (style) {
                 // Mostly ASCII with occasional specials.
@@ -206,6 +221,9 @@ test "decode simd matches scalar" {
                     2 => 0x1B,
                     else => rand.intRangeAtMost(u8, 0x20, 0x7E),
                 },
+                // Bytes at the edges of the ranges of Unicode Table 3-7,
+                // for overlong, surrogate and out of range sequences.
+                2 => edges[rand.uintLessThan(usize, edges.len)],
                 // Fully random bytes.
                 else => rand.int(u8),
             };
