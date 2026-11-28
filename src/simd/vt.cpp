@@ -1,20 +1,6 @@
-// Generates code for every target that this compiler can support.
-#undef HWY_TARGET_INCLUDE
-#define HWY_TARGET_INCLUDE "simd/vt.cpp"  // this file
-#include <hwy/foreach_target.h>           // must come before highway.h
-#include <hwy/highway.h>
-
 #include <simdutf.h>
 
-#include <simd/index_of.h>
-
-HWY_BEFORE_NAMESPACE();
 namespace ghostty {
-namespace HWY_NAMESPACE {
-
-namespace hn = hwy::HWY_NAMESPACE;
-
-using T = uint8_t;
 
 // Compute the length of the maximal subpart of an ill-formed UTF-8
 // subsequence starting at p[0], per Unicode Table 3-7 and the W3C
@@ -154,11 +140,10 @@ static size_t TrimValidPartialUTF8(const uint8_t* input, size_t len) {
 // replacement character (U+FFFD) following the W3C/Unicode "U+FFFD
 // Substitution of Maximal Subparts" algorithm and continuing to decode.
 // This function will consume the entire input no matter what.
-size_t DecodeUTF8(const uint8_t* HWY_RESTRICT input,
-                  size_t count,
-                  char32_t* output) {
-  // Its possible for our input to be empty since DecodeUTF8UntilControlSeq
-  // doesn't check for this.
+static size_t DecodeUTF8(const uint8_t* input,
+                         size_t count,
+                         char32_t* output) {
+  // The input is empty when it was all a trailing incomplete sequence.
   if (count == 0) {
     return 0;
   }
@@ -213,109 +198,21 @@ size_t DecodeUTF8(const uint8_t* HWY_RESTRICT input,
   return static_cast<size_t>(out - output);
 }
 
-/// Decode the UTF-8 text in input into output until an escape
-/// character is found. This returns the number of bytes consumed
-/// from input and writes the number of decoded characters into
-/// output_count.
-///
-/// This may return a value less than count even with no escape
-/// character if the input ends with an incomplete UTF-8 sequence.
-/// The caller should check the next byte manually to determine
-/// if it is incomplete.
-template <class D>
-size_t DecodeUTF8UntilControlSeqImpl(D d,
-                                     const T* HWY_RESTRICT input,
-                                     size_t count,
-                                     char32_t* output,
-                                     size_t* output_count) {
-  const size_t N = hn::Lanes(d);
-
-  // Create a vector containing ESC since that denotes a control sequence.
-  const hn::Vec<D> esc_vec = Set(d, 0x1B);
-
-  // Compare N elements at a time.
-  size_t i = 0;
-  for (; i + N <= count; i += N) {
-    // Load the N elements from our input into a vector.
-    const hn::Vec<D> input_vec = hn::LoadU(d, input + i);
-
-    // If we don't have any escapes we keep going. We want to accumulate
-    // the largest possible valid UTF-8 sequence before decoding.
-    const size_t esc_idx = IndexOfChunk(d, esc_vec, input_vec);
-    if (esc_idx == kNotFound) {
-      continue;
-    }
-
-    // We have an ESC char, decode up to this point. We start by assuming
-    // a valid UTF-8 sequence and slow-path into error handling if we find
-    // an invalid sequence.
-    *output_count = DecodeUTF8(input, i + esc_idx, output);
-    return i + esc_idx;
-  }
-
-  // Leftover input (< N bytes): process one byte at a time.
-  for (; i < count; ++i) {
-    if (input[i] == 0x1B) {
-      *output_count = DecodeUTF8(input, i, output);
-      return i;
-    }
-  }
-
-  // If we reached this point, its possible for our input to have an
-  // incomplete sequence because we're consuming the full input. We need
-  // to trim any incomplete sequences from the end of the input.
-  //
-  // We use our own trim instead of simdutf::trim_partial_utf8 because
-  // we only want to trim sequences that are valid-so-far (true partial
-  // sequences that may be completed by future input). Invalid bytes
-  // like C0, C1, F5-FF should NOT be trimmed — they should be passed
-  // through to DecodeUTF8 which will replace them with U+FFFD per the
-  // maximal subpart algorithm.
-  const size_t trimmed_len = TrimValidPartialUTF8(input, count);
-  *output_count = DecodeUTF8(input, trimmed_len, output);
-  return trimmed_len;
-}
-
-size_t DecodeUTF8UntilControlSeq(const uint8_t* HWY_RESTRICT input,
-                                 size_t count,
-                                 char32_t* output,
-                                 size_t* output_count) {
-  const hn::ScalableTag<uint8_t> d;
-  return DecodeUTF8UntilControlSeqImpl(d, input, count, output, output_count);
-}
-
-}  // namespace HWY_NAMESPACE
-}  // namespace ghostty
-HWY_AFTER_NAMESPACE();
-
-// HWY_ONCE is true for only one of the target passes
-#if HWY_ONCE
-
-namespace ghostty {
-
-HWY_EXPORT(DecodeUTF8UntilControlSeq);
-
-size_t DecodeUTF8UntilControlSeq(const uint8_t* HWY_RESTRICT input,
-                                 size_t count,
-                                 char32_t* output,
-                                 size_t* output_count) {
-  return HWY_DYNAMIC_DISPATCH(DecodeUTF8UntilControlSeq)(input, count, output,
-                                                         output_count);
-}
-
 }  // namespace ghostty
 
 extern "C" {
 
-size_t ghostty_simd_decode_utf8_until_control_seq(const uint8_t* HWY_RESTRICT
-                                                      input,
-                                                  size_t count,
-                                                  char32_t* output,
-                                                  size_t* output_count) {
-  return ghostty::DecodeUTF8UntilControlSeq(input, count, output,
-                                            output_count);
+// Decode all of the UTF-8 in input into output, except a trailing
+// sequence that is well-formed so far but incomplete, which the next
+// input may complete. Returns the number of bytes consumed and writes the
+// number of decoded characters into output_count.
+size_t ghostty_simd_decode_utf8(const uint8_t* input,
+                                size_t count,
+                                char32_t* output,
+                                size_t* output_count) {
+  const size_t trimmed = ghostty::TrimValidPartialUTF8(input, count);
+  *output_count = ghostty::DecodeUTF8(input, trimmed, output);
+  return trimmed;
 }
 
 }  // extern "C"
-
-#endif  // HWY_ONCE

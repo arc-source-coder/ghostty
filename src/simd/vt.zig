@@ -2,9 +2,10 @@ const std = @import("std");
 const options = @import("build_options");
 const assert = @import("../quirks.zig").inlineAssert;
 const firstTrue = @import("main.zig").firstTrue;
+const lanes = @import("main.zig").lanes;
 
 // vt.cpp
-extern "c" fn ghostty_simd_decode_utf8_until_control_seq(
+extern "c" fn ghostty_simd_decode_utf8(
     input: [*]const u8,
     count: usize,
     output: [*]u32,
@@ -16,44 +17,72 @@ const DecodeResult = struct {
     decoded: usize,
 };
 
-/// Decode UTF-8 from input into output until an ESC.
+/// Decode UTF-8 from input into output until an ESC. Ill-formed
+/// sequences decode to U+FFFD following the W3C/Unicode "U+FFFD
+/// Substitution of Maximal Subparts" algorithm. Without an ESC, a
+/// trailing sequence that is well-formed so far but incomplete is left
+/// unconsumed, since the next input may complete it.
 pub fn utf8DecodeUntilControlSeq(
     input: []const u8,
     output: []u32,
 ) DecodeResult {
     assert(output.len >= input.len);
 
-    if (comptime !options.simd) return utf8DecodeUntilControlSeqScalar(input, output);
+    const end = indexOfEsc(input);
+    const res = utf8Decode(input[0..end], output);
+    if (end == input.len or res.consumed == end) return res;
 
-    // Runs between escape sequences are often a few bytes, like a single
-    // glyph between two SGR sequences. vt.cpp would pay a Highway
-    // dispatch to find their ESC, and simdutf its own dispatch and a
-    // virtual call, only to decode them with scalar code anyway: simdutf
-    // decodes a 64-byte block with SIMD only while a margin covering the
-    // last few characters follows it, 16 bytes for two-byte text. So
-    // decode runs that end within that many bytes here.
-    //
-    // One compare of all those bytes finds whether the ESC is among
-    // them. It doesn't stop early at an ESC in the first few bytes like
-    // std.mem.indexOfScalar, but it doesn't loop or finish a byte at a
-    // time either, which costs long runs more.
-    const short_len = 80;
-    if (input.len <= short_len) return utf8DecodeUntilControlSeqScalar(input, output);
-    const V = @Vector(short_len, u8);
-    const short: V = input[0..short_len].*;
-    if (@reduce(.Or, short == @as(V, @splat(0x1B)))) {
-        return utf8DecodeUntilControlSeqScalar(input, output);
-    }
-
-    return utf8DecodeUntilControlSeqSimd(input, output);
+    // A sequence cut off by an ESC can never be completed, so its
+    // maximal subpart maps to a single FFFD.
+    output[res.decoded] = 0xFFFD;
+    return .{ .consumed = end, .decoded = res.decoded + 1 };
 }
 
-fn utf8DecodeUntilControlSeqSimd(
+/// The index of the first ESC in input, or its length if it has none.
+fn indexOfEsc(input: []const u8) usize {
+    var i: usize = 0;
+    if (comptime lanes(u8)) |n| {
+        const V = @Vector(n, u8);
+        const esc: V = @splat(0x1B);
+        while (i + n <= input.len) : (i += n) {
+            const v: V = input[i..][0..n].*;
+            if (firstTrue(u8, v == esc)) |j| return i + j;
+        }
+
+        // Finish with a vector that ends at the end of the input. The
+        // bytes it shares with the last one have no ESC.
+        if (input.len >= n) {
+            const v: V = input[input.len - n ..][0..n].*;
+            return if (firstTrue(u8, v == esc)) |j| input.len - n + j else input.len;
+        }
+    }
+    return std.mem.indexOfScalarPos(u8, input, i, 0x1B) orelse input.len;
+}
+
+/// Decode all of input except a trailing sequence that is well-formed
+/// so far but incomplete.
+fn utf8Decode(
+    input: []const u8,
+    output: []u32,
+) DecodeResult {
+    // Runs between escape sequences are often a few bytes, like a single
+    // glyph between two SGR sequences. simdutf pays a runtime dispatch
+    // and a virtual call per call, and decodes a 64-byte block with SIMD
+    // only while a margin covering the last few characters follows it, so
+    // it decodes short runs with scalar code anyway. So decode runs up to
+    // a few lines long here.
+    const short_len = 192;
+    if (comptime !options.simd) return utf8DecodeScalar(input, output);
+    if (input.len <= short_len) return utf8DecodeScalar(input, output);
+    return utf8DecodeSimd(input, output);
+}
+
+fn utf8DecodeSimd(
     input: []const u8,
     output: []u32,
 ) DecodeResult {
     var decoded: usize = 0;
-    const consumed = ghostty_simd_decode_utf8_until_control_seq(
+    const consumed = ghostty_simd_decode_utf8(
         input.ptr,
         input.len,
         output.ptr,
@@ -62,22 +91,18 @@ fn utf8DecodeUntilControlSeqSimd(
     return .{ .consumed = consumed, .decoded = decoded };
 }
 
-fn utf8DecodeUntilControlSeqScalar(
+fn utf8DecodeScalar(
     input: []const u8,
     output: []u32,
 ) DecodeResult {
-    // Decode one codepoint at a time until an ESC, following the
-    // W3C/Unicode "U+FFFD Substitution of Maximal Subparts" algorithm
-    // for ill-formed subsequences.
+    // Decode one codepoint at a time.
     var i: usize = 0;
     var count: usize = 0;
     while (i < input.len) {
         const b0 = input[i];
         if (b0 < 0x80) {
-            if (b0 == 0x1B) break;
-
-            // Widen ASCII a whole vector at a time, up to the next ESC
-            // or non-ASCII byte. The output past that gets overwritten,
+            // Widen ASCII a whole vector at a time, up to the next
+            // non-ASCII byte. The output past that gets overwritten,
             // and there is room for it: count <= i and output.len >=
             // input.len. Zig doesn't vectorize loops, so this has to be
             // explicit. It also works when simd=false, which only
@@ -87,8 +112,7 @@ fn utf8DecodeUntilControlSeqScalar(
                 while (true) {
                     const v: V = input[i..][0..vl].*;
                     output[count..][0..vl].* = @as(@Vector(vl, u32), v);
-                    const stop = (v >= @as(V, @splat(0x80))) | (v == @as(V, @splat(0x1B)));
-                    if (firstTrue(u8, stop)) |n| {
+                    if (firstTrue(u8, v >= @as(V, @splat(0x80)))) |n| {
                         count += n;
                         i += n;
                         break;
@@ -157,9 +181,7 @@ fn utf8DecodeUntilControlSeqScalar(
 
         // Count the continuation bytes that form a valid prefix (the
         // maximal subpart). Only the first has a lead-dependent range
-        // per Table 3-7; later ones are always 80-BF. An ESC is never in
-        // range, so a sequence cut off by an ESC can never be completed
-        // and its maximal subpart maps to a single FFFD.
+        // per Table 3-7; later ones are always 80-BF.
         const seq_len: usize = if (b0 < 0xE0) 2 else if (b0 < 0xF0) 3 else 4;
         const cb1_lo: u8, const cb1_hi: u8 = switch (b0) {
             0xE0 => .{ 0xA0, 0xBF },
@@ -171,7 +193,7 @@ fn utf8DecodeUntilControlSeqScalar(
         var valid: usize = 1;
         while (valid < seq_len) : (valid += 1) {
             // A sequence cut off by the end of the input may be completed
-            // by future input, so stop without consuming it.
+            // by the next input, so stop without consuming it.
             if (valid == rest.len) return .{
                 .consumed = i,
                 .decoded = count,
@@ -193,8 +215,8 @@ fn utf8DecodeUntilControlSeqScalar(
 
 // Differential test: the SIMD implementation must agree with the
 // scalar implementation on any input. Exercises random mixtures of
-// ASCII, escapes, controls, valid and invalid UTF-8, at various
-// lengths (including chunk-boundary straddling cases).
+// ASCII, controls, valid and invalid UTF-8, at various lengths
+// (including chunk-boundary straddling cases).
 test "decode simd matches scalar" {
     if (comptime !options.simd) return error.SkipZigTest;
 
@@ -206,7 +228,7 @@ test "decode simd matches scalar" {
         0x1B, 0x41, 0x7F, 0x80, 0x8F, 0x90, 0x9F, 0xA0, 0xBF, 0xC0, 0xC1, 0xC2, 0xDF,
         0xE0, 0xE1, 0xEC, 0xED, 0xEE, 0xEF, 0xF0, 0xF1, 0xF3, 0xF4, 0xF5, 0xFF,
     };
-    var input: [257]u8 = undefined;
+    var input: [600]u8 = undefined;
     var out_simd: [input.len]u32 = undefined;
     var out_scalar: [input.len]u32 = undefined;
 
@@ -217,16 +239,14 @@ test "decode simd matches scalar" {
             b.* = switch (style) {
                 // Mostly ASCII with occasional specials.
                 0 => switch (rand.intRangeAtMost(u8, 0, 20)) {
-                    0 => 0x1B,
-                    1 => rand.intRangeAtMost(u8, 0, 0x1F),
-                    2 => rand.int(u8),
+                    0 => rand.intRangeAtMost(u8, 0, 0x1F),
+                    1, 2 => rand.int(u8),
                     else => rand.intRangeAtMost(u8, 0x20, 0x7E),
                 },
                 // Heavy multi-byte/invalid UTF-8.
-                1 => switch (rand.intRangeAtMost(u8, 0, 3)) {
+                1 => switch (rand.intRangeAtMost(u8, 0, 2)) {
                     0 => rand.intRangeAtMost(u8, 0x80, 0xBF),
                     1 => rand.intRangeAtMost(u8, 0xC0, 0xFF),
-                    2 => 0x1B,
                     else => rand.intRangeAtMost(u8, 0x20, 0x7E),
                 },
                 // Bytes at the edges of the ranges of Unicode Table 3-7,
@@ -238,23 +258,15 @@ test "decode simd matches scalar" {
         }
 
         errdefer std.debug.print("input={x}\n", .{input[0..len]});
-        const res_scalar = utf8DecodeUntilControlSeqScalar(input[0..len], &out_scalar);
-
-        // Both vt.cpp alone, which decodes only long runs otherwise, and
-        // the decoder that picks one of the two by the length of the run.
-        for ([_]*const fn ([]const u8, []u32) DecodeResult{
-            utf8DecodeUntilControlSeqSimd,
-            utf8DecodeUntilControlSeq,
-        }) |decode| {
-            const res_simd = decode(input[0..len], &out_simd);
-            try testing.expectEqual(res_scalar.consumed, res_simd.consumed);
-            try testing.expectEqual(res_scalar.decoded, res_simd.decoded);
-            try testing.expectEqualSlices(
-                u32,
-                out_scalar[0..res_scalar.decoded],
-                out_simd[0..res_simd.decoded],
-            );
-        }
+        const res_scalar = utf8DecodeScalar(input[0..len], &out_scalar);
+        const res_simd = utf8DecodeSimd(input[0..len], &out_simd);
+        try testing.expectEqual(res_scalar.consumed, res_simd.consumed);
+        try testing.expectEqual(res_scalar.decoded, res_simd.decoded);
+        try testing.expectEqualSlices(
+            u32,
+            out_scalar[0..res_scalar.decoded],
+            out_simd[0..res_simd.decoded],
+        );
     }
 }
 
@@ -574,6 +586,32 @@ test "decode partial UTF-8 before escape" {
         try testing.expectEqual(@as(usize, 1), result.decoded);
         try testing.expectEqual(@as(u32, 0xFFFD), output[0]);
     }
+}
+
+test "decode long run with a partial UTF-8 sequence" {
+    const testing = std.testing;
+
+    // 150 é and a 2-byte lead, long enough for vt.cpp.
+    var input: [302]u8 = undefined;
+    var output: [input.len]u32 = undefined;
+    for (0..150) |i| input[i * 2 ..][0..2].* = "\xC3\xA9".*;
+    input[300] = 0xC3;
+
+    // Cut off by an ESC, the lead is one U+FFFD.
+    input[301] = 0x1B;
+    try testing.expectEqual(DecodeResult{
+        .consumed = 301,
+        .decoded = 151,
+    }, utf8DecodeUntilControlSeq(&input, &output));
+    for (output[0..150]) |cp| try testing.expectEqual(@as(u32, 0xE9), cp);
+    try testing.expectEqual(@as(u32, 0xFFFD), output[150]);
+
+    // Cut off by the end of the input, the lead is left for the next
+    // input to complete.
+    try testing.expectEqual(DecodeResult{
+        .consumed = 300,
+        .decoded = 150,
+    }, utf8DecodeUntilControlSeq(input[0..301], &output));
 }
 
 test "decode invalid byte before escape" {
