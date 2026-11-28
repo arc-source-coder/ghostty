@@ -976,16 +976,177 @@ inline fn printSliceStoreRun(
     }
 }
 
-/// Our fast path can only handle "simple" cells. A simple cell is
-/// a codepoint cell (no grapheme data or bg-color tag), narrow, and
-/// not a hyperlink. The mask covers every field that must match
-/// the expected value (see printSliceCheckExpected) exactly.
-const PrintSliceSimpleMask = pagepkg.Mask(Cell, &.{
+/// The fields in which a plain cell in our style, which printSliceClear
+/// leaves alone, differs from other cells.
+const PrintSlicePlainMask = pagepkg.Mask(Cell, &.{
     "content_tag",
     "style_id",
     "wide",
     "hyperlink",
 }, 4);
+
+/// The style of a cell and whether it holds a grapheme or link, for
+/// printSliceClearSlow to find runs of cells alike in all three.
+const PrintSliceCleanupMask = pagepkg.Mask(Cell, &.{
+    "style_id",
+    "content_tag",
+    "hyperlink",
+}, 4);
+
+/// Does to the `len` cells from the cursor what print() does to each cell
+/// it overwrites (see writeCell), so that the caller can store over all
+/// of them, and moves their style references to `style_id`. `new_wide` is
+/// the `wide` of the first two cells the caller stores (only the first if
+/// `len` is 1).
+///
+/// Only the checks for cells that need nothing are inline, so that the
+/// fills stay small; printSliceClearSlow does the rest.
+inline fn printSliceClear(
+    self: *Terminal,
+    page: *pagepkg.Page,
+    len: usize,
+    new_wide: [2]Cell.Wide,
+    style_id: style.Id,
+) void {
+    const cursor = &self.screens.active.cursor;
+    const row = cursor.page_row;
+    if (cursor.x >= row.extent) {
+        // Cells at or right of the row's extent are zero cells (see
+        // Row.extent), which need no cleanup, only references to our style.
+        if (style_id != style.default_id) {
+            page.styles.useMultiple(page.memory, style_id, @intCast(len));
+        }
+        return;
+    }
+
+    // Plain cells in one style, as a redraw leaves them, need only their
+    // references moved to our style, if that's another one. So do cells
+    // of one background color, as an erase in that color leaves them
+    // (see Screen.blankCell). Rows without styled, grapheme or linked
+    // cells hold only such cells in the default style, unless a wide cell
+    // is cut at an end or wrapped from the row above.
+    const cells: [*]Cell = @ptrCast(cursor.page_cell);
+    if (row.styled or row.grapheme or row.hyperlink) {
+        const Plain = PrintSlicePlainMask;
+        const old_id = cells[0].style_id;
+        const tag: Cell.ContentTag = switch (cells[0].content_tag) {
+            .codepoint, .codepoint_grapheme => .codepoint,
+            .bg_color_palette, .bg_color_rgb => |tag| tag,
+        };
+        const plain = Plain.pattern(.{ .content_tag = tag, .style_id = old_id });
+        if (Plain.eqlEnd(cells[0..len], 0, plain) == len) {
+            if (old_id != style_id) {
+                if (old_id != style.default_id) page.styles.releaseMultiple(page.memory, old_id, @intCast(len));
+                if (style_id != style.default_id) page.styles.useMultiple(page.memory, style_id, @intCast(len));
+            }
+            return;
+        }
+    } else if (cells[0].wide != .spacer_tail and
+        cells[len - 1].wide != .wide and
+        // The cells of the first two columns that a wide character wrapped
+        // from the row above could be in (see printSliceClearSlow).
+        (cursor.x > 1 or (cells[0].wide == .narrow and
+            (cursor.x == 1 or len == 1 or cells[1].wide == .narrow))))
+    {
+        if (style_id != style.default_id) {
+            page.styles.useMultiple(page.memory, style_id, @intCast(len));
+        }
+        return;
+    }
+    @call(.never_inline, printSliceClearSlow, .{ self, page, len, new_wide, style_id });
+}
+
+/// printSliceClear for ranges whose cells may need cleanup.
+///
+/// Over a range, most of that cancels out. Overwriting half of a wide
+/// cell clears the other half, which only matters at the ends: the cells
+/// in between are overwritten anyway.
+fn printSliceClearSlow(
+    self: *Terminal,
+    page: *pagepkg.Page,
+    len: usize,
+    new_wide: [2]Cell.Wide,
+    style_id: style.Id,
+) void {
+    const screen: *Screen = self.screens.active;
+    const cursor = &screen.cursor;
+    const row = cursor.page_row;
+    const cells: [*]Cell = @ptrCast(cursor.page_cell);
+    const range = cells[0..len];
+
+    // A wide character that wrapped from the previous row leaves a spacer
+    // head at its end. print() turns that into a narrow cell when it
+    // changes a wide cell or spacer tail in the first two columns.
+    if (cursor.y > 0 and cursor.x <= 1) {
+        const n = @min(len, 2 - cursor.x);
+        for (range[0..n], new_wide[0..n]) |cell, new| {
+            if (cell.wide != new and (cell.wide == .wide or cell.wide == .spacer_tail)) {
+                @branchHint(.unlikely);
+                const head = screen.cursorCellEndOfPrev();
+                if (head.wide == .spacer_head) head.wide = .narrow;
+                break;
+            }
+        }
+    }
+
+    // A wide cell that an end of the range cuts in half: clear both
+    // halves, including the one outside the range.
+    if (range[0].wide == .spacer_tail) {
+        @branchHint(.unlikely);
+        screen.clearCells(page, row, (cells - 1)[0..2]);
+    }
+    if (range[len - 1].wide == .wide and cursor.x + len < self.cols) {
+        @branchHint(.unlikely);
+        screen.clearCells(page, row, cells[len - 1 ..][0..2]);
+    }
+
+    // Move the references of the cells in other styles to ours and free
+    // their graphemes and links, one run of cells alike in those at a
+    // time. Without styled cells, every cell is in the default style,
+    // which has none, and only rows marked for graphemes and links can
+    // hold them. Links stay if the new cells are linked: the caller's
+    // setHyperlinkRun replaces them, as setHyperlink does in print().
+    var restyled = len;
+    if (row.styled or row.grapheme or row.hyperlink) {
+        const Mask = PrintSliceCleanupMask;
+        const content = row.grapheme or row.hyperlink;
+        const unlink = cursor.hyperlink_id == 0;
+        restyled = 0;
+        var graphemes = false;
+        var links = false;
+        var i: usize = 0;
+        while (i < len) {
+            const first = range[i];
+            const end = Mask.eqlEnd(range, i + 1, Mask.pattern(first));
+            if (first.style_id != style_id) {
+                if (first.style_id != style.default_id) {
+                    page.styles.releaseMultiple(page.memory, first.style_id, @intCast(end - i));
+                }
+                restyled += end - i;
+            }
+            const unlinked = first.hyperlink and unlink;
+            if (content and (first.hasGrapheme() or unlinked)) {
+                @branchHint(.unlikely);
+                // The cells don't match the references moved so far until
+                // the caller stores over them (as in clearCells).
+                page.pauseIntegrityChecks(true);
+                defer page.pauseIntegrityChecks(false);
+                for (range[i..end]) |*cell| {
+                    if (first.hasGrapheme()) page.clearGrapheme(cell);
+                    if (unlinked) page.clearHyperlink(cell);
+                }
+                graphemes = graphemes or first.hasGrapheme();
+                links = links or unlinked;
+            }
+            i = end;
+        }
+        if (graphemes) page.updateRowGraphemeFlag(row);
+        if (links) page.updateRowHyperlinkFlag(row);
+    }
+    if (style_id != style.default_id and restyled > 0) {
+        page.styles.useMultiple(page.memory, style_id, @intCast(restyled));
+    }
+}
 
 /// The row-filling portion of the printSlice fast path, specialized by
 /// width class and by whether the cells written are linked to the
@@ -1007,11 +1168,7 @@ fn printSliceFill(
     };
     assert(charset_table == null or !allow_unicode);
 
-    const SimpleMask = PrintSliceSimpleMask;
-
-    // The bit offset of the codepoint content within a Cell, used to
-    // construct cell values from a template without field assignments.
-    const cp_shift = @bitOffsetOf(Cell, "content");
+    const cursor = &screen.cursor;
 
     // Determine the run of codepoints in the same width class that we
     // can batch. For codepoints after the first, the previous codepoint
@@ -1080,14 +1237,14 @@ fn printSliceFill(
     const cells_per_cp: usize = comptime width.cellsPerCp();
 
     var printed: usize = 0;
-    outer: while (printed < run_len) {
+    while (printed < run_len) {
         // If we're soft-wrapping, handle that first so that our cursor
         // is in the row/column that will receive the next codepoint.
-        if (screen.cursor.pending_wrap) try self.printWrap();
+        if (cursor.pending_wrap) try self.printWrap();
 
         // Our right margin depends on where our cursor is now,
         // matching the logic in print().
-        const right_limit: usize = if (screen.cursor.x > self.scrolling_region.right)
+        const right_limit: usize = if (cursor.x > self.scrolling_region.right)
             self.cols
         else
             self.scrolling_region.right + 1;
@@ -1098,7 +1255,6 @@ fn printSliceFill(
             if (right_limit - self.scrolling_region.left <= 1) break;
         }
 
-        const cursor = &screen.cursor;
         const avail: usize = right_limit - cursor.x;
         assert(avail > 0);
 
@@ -1106,55 +1262,18 @@ fn printSliceFill(
         // its page cannot be compressed while this print path is active.
         const page = cursor.page_pin.node.pageAssumeResident();
         const cells: [*]Cell = @ptrCast(cursor.page_cell);
-
-        // The style and hyperlink IDs are per page, and a wrap can move
-        // the cursor to another page (which re-interns both), so read
-        // them for every row. If re-interning the link failed, the
-        // cursor has no link any more: return, so that the caller
-        // continues unlinked. Without a link to start with, the cursor
-        // can't get one by moving.
-        const style_id = cursor.style_id;
-        const link_id = cursor.hyperlink_id;
-        if (comptime linked) {
-            if (link_id == 0) break;
-        } else assert(link_id == 0);
-        const template: Cell = .{
-            .content_tag = .codepoint,
-            .content = .{ .codepoint = .{ .data = 0 } },
-            .style_id = style_id,
-            .wide = .narrow,
-            .protected = cursor.protected,
-            .hyperlink = linked,
-            .semantic_content = cursor.semantic_content,
-        };
-        const template_bits: u64 = @bitCast(template);
-        const check_expected: u64 = printSliceCheckExpected(style_id);
+        const template = printSliceTemplate(cursor, linked) orelse break;
 
         if (comptime width == .wide) {
             if (avail == 1) {
                 // Only one cell left in the row: print() writes a
                 // spacer head (or a blank narrow cell if we're inside
-                // a right margin) and wraps. We require a simple cell,
-                // otherwise fall back to print() for the cleanup.
-                if (!SimpleMask.eqlScalar(cells[0], check_expected)) break;
-
-                // print() links the spacer head too. If the hyperlink
-                // map is full, print() grows the page for it.
+                // a right margin) over it and wraps. print() links the
+                // spacer head too. If the hyperlink map is full, print()
+                // grows the page for it.
                 if (linked and page.hyperlinkCellsFree() == 0) break;
-
-                var spacer = template;
-                if (right_limit == self.cols) {
-                    cursor.page_row.wrap = true;
-                    spacer.wide = .spacer_head;
-                }
-                cursor.page_row.markWritten(cursor.x + 1);
-                if (style_id != style.default_id) cursor.page_row.styled = true;
-                cells[0] = spacer;
-                if (linked) {
-                    page.setHyperlinkRun(cursor.page_row, cells[0..1], link_id);
-                }
-                try self.printWrap();
-                continue :outer;
+                self.printSliceSpacerHead(page, template, right_limit);
+                continue;
             }
         }
 
@@ -1173,244 +1292,148 @@ fn printSliceFill(
         assert(count > 0);
         const cell_count = count * cells_per_cp;
 
-        // Wide cells always come in (wide, spacer_tail) pairs.
-        const spacer_bits: u64 = if (comptime width == .wide) spacer: {
+        self.printSliceClear(page, cell_count, switch (width) {
+            .narrow => .{ .narrow, .narrow },
+            .wide => .{ .wide, .spacer_tail },
+        }, template.style_id);
+
+        if (comptime width == .wide) {
+            // Wide cells always come in (wide, spacer_tail) pairs.
+            var wide = template;
+            wide.wide = .wide;
             var spacer = template;
             spacer.wide = .spacer_tail;
-            break :spacer @bitCast(spacer);
-        } else undefined;
-        const wide_bits: u64 = if (comptime width == .wide) wb: {
-            var w = template;
-            w.wide = .wide;
-            break :wb @bitCast(w);
-        } else undefined;
+            const wide_bits: u64 = @bitCast(wide);
+            const spacer_bits: u64 = @bitCast(spacer);
 
-        var k: usize = 0; // cells written
-        fill: while (k < cell_count) {
-            // Find the run of simple cells so the store loop below is
-            // branch-free (and vectorizable). This is an early-exit
-            // search loop that LLVM won't auto-vectorize, and reused
-            // rows typically match the whole way through, so scan
-            // several cells at a time manually.
-            var simple = k;
-            simple: {
-                // Cells at or right of the row's extent are zero cells
-                // (see Row.extent): each is simple once it holds a
-                // reference to our style, so there is nothing to scan.
-                if (cursor.x + k >= cursor.page_row.extent) {
-                    if (style_id != style.default_id) {
-                        page.styles.useMultiple(page.memory, style_id, @intCast(cell_count - k));
-                    }
-                    simple = cell_count;
-                    break :simple;
-                }
-                while (simple + SimpleMask.group_len <= cell_count) {
-                    const p = SimpleMask.eqlPrefix(
-                        cells[0..cell_count],
-                        simple,
-                        check_expected,
-                    );
-                    simple += p;
-                    if (p != SimpleMask.group_len) break :simple;
-                }
-                while (simple < cell_count) : (simple += 1) {
-                    if (!SimpleMask.eqlScalar(
-                        cells[simple],
-                        check_expected,
-                    )) break;
+            // The bit offset of the codepoint content within a Cell, used
+            // to construct cell values from a template without field
+            // assignments.
+            const cp_shift = @bitOffsetOf(Cell, "content");
+
+            var idx: usize = 0;
+
+            // Manually vectorized for the same reason as
+            // printSliceStoreRun: build a vector of wide cells,
+            // interleave with spacer tails, and store (wide,
+            // spacer) pairs several at a time.
+            if (simd.lanes(u64)) |lanes| {
+                const pair_lanes = lanes / 2;
+                const Vp = @Vector(pair_lanes, u64);
+                const wide_v: Vp = @splat(wide_bits);
+                const spacer_v: Vp = @splat(spacer_bits);
+                const shift_v: @Vector(
+                    pair_lanes,
+                    std.math.Log2Int(u64),
+                ) = @splat(cp_shift);
+                while (idx + lanes <= cell_count) : (idx += lanes) {
+                    const narrow: @Vector(pair_lanes, u32) =
+                        cps[printed + idx / 2 ..][0..pair_lanes].*;
+                    const wides: Vp = wide_v | (@as(Vp, @intCast(narrow)) << shift_v);
+                    const pairs: [lanes]u64 = std.simd.interlace(.{
+                        wides,
+                        spacer_v,
+                    });
+                    cells[idx..][0..lanes].* = @bitCast(pairs);
                 }
             }
-
-            if (comptime width == .wide) {
-                // We can only write whole (wide, spacer) pairs.
-                const pair_end = k + (simple - k) / 2 * 2;
-                var idx = k;
-
-                // Manually vectorized for the same reason as
-                // printSliceStoreRun: build a vector of wide cells,
-                // interleave with spacer tails, and store (wide,
-                // spacer) pairs several at a time.
-                if (simd.lanes(u64)) |lanes| {
-                    const pair_lanes = lanes / 2;
-                    const Vp = @Vector(pair_lanes, u64);
-                    const wide_v: Vp = @splat(wide_bits);
-                    const spacer_v: Vp = @splat(spacer_bits);
-                    const shift_v: @Vector(
-                        pair_lanes,
-                        std.math.Log2Int(u64),
-                    ) = @splat(cp_shift);
-                    while (idx + 2 * pair_lanes <= pair_end) : (idx += 2 * pair_lanes) {
-                        const narrow: @Vector(pair_lanes, u32) =
-                            cps[printed + idx / 2 ..][0..pair_lanes].*;
-                        const wides: Vp = wide_v | (@as(Vp, @intCast(narrow)) << shift_v);
-                        const inter: [2 * pair_lanes]u64 = std.simd.interlace(.{
-                            wides,
-                            spacer_v,
-                        });
-                        cells[idx..][0 .. 2 * pair_lanes].* = @bitCast(inter);
-                    }
-                }
-                while (idx < pair_end) : (idx += 2) {
-                    cells[idx] = @bitCast(
-                        wide_bits | (@as(u64, cps[printed + idx / 2]) << cp_shift),
-                    );
-                    cells[idx + 1] = @bitCast(spacer_bits);
-                }
-
-                // If the simple run ended mid-pair we stop at the pair
-                // boundary and handle the offending cell below.
-                k = pair_end;
-                if (simple != pair_end) {
-                    // The first cell of the next pair is simple but the
-                    // second isn't; handle both via the general path.
-                    simple = pair_end;
-                }
-            } else {
-                printSliceStoreRun(
-                    cells,
-                    Cp,
-                    cps.ptr + printed,
-                    k,
-                    simple,
-                    template_bits,
-                    charset_table,
-                );
-                k = simple;
+            while (idx < cell_count) : (idx += 2) {
+                const cp: u64 = cps[printed + idx / 2];
+                cells[idx] = @bitCast(wide_bits | (cp << cp_shift));
+                cells[idx + 1] = @bitCast(spacer_bits);
             }
-            if (k >= cell_count) break;
-
-            // Bulk path for runs of cells that differ from the
-            // expected simple cell only by their style: this is the
-            // common case when styled text overwrites previously
-            // styled (or default-styled) rows, e.g. TUI redraws.
-            // These runs are handled wholesale: one scan to find the
-            // run of identical old styles, two ref-count updates,
-            // and a branch-free fill.
-            if (comptime width == .narrow) bulk: {
-                const first = SimpleMask.pattern(cells[k]);
-
-                // The old cell must be a plain narrow codepoint cell
-                // with no hyperlink whose only difference is the
-                // style id (see printSliceCheckExpected: every other
-                // masked field must be zero).
-                const style_shift = @bitOffsetOf(Cell, "style_id");
-                const old_style: style.Id = @truncate(first >> style_shift);
-                if (first != printSliceCheckExpected(old_style)) break :bulk;
-                assert(old_style != style_id); // it failed the simple check
-
-                // Find the run of cells with identical masked bits.
-                var m = k + 1;
-                scan: {
-                    while (m + SimpleMask.group_len <= cell_count) {
-                        const p = SimpleMask.eqlPrefix(
-                            cells[0..cell_count],
-                            m,
-                            first,
-                        );
-                        m += p;
-                        if (p != SimpleMask.group_len) break :scan;
-                    }
-                    while (m < cell_count) : (m += 1) {
-                        if (!SimpleMask.eqlScalar(cells[m], first)) break;
-                    }
-                }
-
-                // Fix up the style ref counts for the whole run at
-                // once. Each of the old cells held a reference to
-                // old_style so the release is safe by construction.
-                const n = m - k;
-                if (old_style != style.default_id) {
-                    page.styles.releaseMultiple(page.memory, old_style, @intCast(n));
-                }
-                if (style_id != style.default_id) {
-                    page.styles.useMultiple(page.memory, style_id, @intCast(n));
-                }
-
-                printSliceStoreRun(
-                    cells,
-                    Cp,
-                    cps.ptr + printed,
-                    k,
-                    m,
-                    template_bits,
-                    charset_table,
-                );
-                k = m;
-                continue :fill;
-            }
-
-            // General path for cells that failed the masked check:
-            // style-only mismatches are handled inline; anything that
-            // needs cleanup (wide chars and their spacers, grapheme
-            // data, hyperlinks) falls back to print().
-            const general_count: usize = cells_per_cp;
-            for (0..general_count) |offset| {
-                const cell = &cells[k + offset];
-                if (cell.wide != .narrow or
-                    cell.hasGrapheme() or
-                    cell.hyperlink) break :fill;
-            }
-            for (0..general_count) |offset| {
-                const cell = &cells[k + offset];
-                if (cell.style_id != style_id) {
-                    if (cell.style_id != style.default_id) {
-                        page.styles.release(page.memory, cell.style_id);
-                    }
-                    if (style_id != style.default_id) {
-                        page.styles.use(page.memory, style_id);
-                    }
-                }
-            }
-            if (comptime width == .wide) {
-                cells[k] = @bitCast(
-                    wide_bits | (@as(u64, cps[printed + k / 2]) << cp_shift),
-                );
-                cells[k + 1] = @bitCast(spacer_bits);
-            } else {
-                const cp = if (charset_table) |table|
-                    table[cps[printed + k]]
-                else
-                    cps[printed + k];
-                cells[k] = @bitCast(
-                    template_bits | (@as(u64, cp) << cp_shift),
-                );
-            }
-            k += cells_per_cp;
+        } else {
+            printSliceStoreRun(
+                cells,
+                Cp,
+                cps.ptr + printed,
+                0,
+                cell_count,
+                @bitCast(template),
+                charset_table,
+            );
         }
 
-        if (k > 0) {
-            assert(k % cells_per_cp == 0);
-
-            cursor.page_row.markWritten(cursor.x + k);
-            if (style_id != style.default_id) cursor.page_row.styled = true;
-
-            // Every cell written has the hyperlink flag from the
-            // template; add their map entries and references.
-            if (comptime linked) {
-                page.setHyperlinkRun(cursor.page_row, cells[0..k], link_id);
-            }
-            self.previous_char = @intCast(cps[printed + k / cells_per_cp - 1]);
-            printed += k / cells_per_cp;
-
-            // Advance the cursor. If we filled through the right limit
-            // then the cursor stays on the last cell with the pending
-            // wrap flag set, matching print().
-            if (cursor.x + k >= right_limit) {
-                assert(cursor.x + k == right_limit);
-                screen.cursorRight(@intCast(k - 1));
-                cursor.pending_wrap = true;
-            } else {
-                screen.cursorRight(@intCast(k));
-            }
-        }
-
-        // We hit a cell that requires the slow path. The cursor is
-        // exactly at that cell so return and let the caller print the
-        // next codepoint via print().
-        if (k < cell_count) break;
+        self.previous_char = @intCast(cps[printed + count - 1]);
+        printed += count;
+        self.printSliceWritten(page, template, cell_count, right_limit);
     }
 
     return printed;
+}
+
+/// The narrow cell print() writes at the cursor, with a zero codepoint,
+/// or null if the fill is `linked` and the cursor has no link any more.
+///
+/// The style and hyperlink IDs are per page, and a wrap can move the
+/// cursor to another page (which re-interns both), so fills get this for
+/// every row. If re-interning the link failed, the cursor has no link any
+/// more: the fill returns, and printSlice continues unlinked. Without a
+/// link to start with, the cursor can't get one by moving.
+inline fn printSliceTemplate(cursor: *const Screen.Cursor, comptime linked: bool) ?Cell {
+    if (comptime linked) {
+        if (cursor.hyperlink_id == 0) return null;
+    } else assert(cursor.hyperlink_id == 0);
+    return .{
+        .content_tag = .codepoint,
+        .content = .{ .codepoint = .{ .data = 0 } },
+        .style_id = cursor.style_id,
+        .wide = .narrow,
+        .protected = cursor.protected,
+        .hyperlink = linked,
+        .semantic_content = cursor.semantic_content,
+    };
+}
+
+/// Does for the `n` cells just stored from the cursor, from `template`,
+/// what print() does for each cell it writes: marks the row, links the
+/// cells if the template is linked, and moves the cursor past them, onto
+/// the last one with a pending wrap if they reach `right_limit`.
+inline fn printSliceWritten(
+    self: *Terminal,
+    page: *pagepkg.Page,
+    template: Cell,
+    n: usize,
+    right_limit: usize,
+) void {
+    const screen: *Screen = self.screens.active;
+    const cursor = &screen.cursor;
+    cursor.page_row.markWritten(cursor.x + n);
+    if (template.style_id != style.default_id) cursor.page_row.styled = true;
+    if (template.hyperlink) {
+        const cells: [*]Cell = @ptrCast(cursor.page_cell);
+        page.setHyperlinkRun(cursor.page_row, cells[0..n], cursor.hyperlink_id);
+    }
+    assert(cursor.x + n <= right_limit);
+    if (cursor.x + n == right_limit) {
+        screen.cursorRight(@intCast(n - 1));
+        cursor.pending_wrap = true;
+    } else {
+        screen.cursorRight(@intCast(n));
+    }
+}
+
+/// Writes what print() leaves in the cursor cell, the last one before
+/// `right_limit`, when a wide codepoint doesn't fit: a spacer head (or a
+/// blank narrow cell inside a right margin), in `template`'s style and
+/// link, with a pending wrap for the codepoint. The caller checked that
+/// the hyperlink map has room for it if it is linked.
+fn printSliceSpacerHead(
+    self: *Terminal,
+    page: *pagepkg.Page,
+    template: Cell,
+    right_limit: usize,
+) void {
+    const cursor = &self.screens.active.cursor;
+    self.printSliceClear(page, 1, .{ .narrow, undefined }, template.style_id);
+
+    var spacer = template;
+    if (right_limit == self.cols) {
+        cursor.page_row.wrap = true;
+        spacer.wide = .spacer_head;
+    }
+    cursor.page_cell.* = spacer;
+    self.printSliceWritten(page, template, 1, right_limit);
 }
 
 /// The printSlice fast path for codepoints of both width classes
@@ -1423,11 +1446,13 @@ fn printSliceFill(
 ///
 /// This writes one codepoint at a time without branching on its
 /// width: a wide codepoint's spacer tail goes to the cell after it,
-/// and a narrow codepoint writes its own cell in the same place. It
-/// stops at the first codepoint that isn't eligible (zero width, a
-/// grapheme continuation under mode 2027, C0, the Kitty placeholder),
-/// at the first target cell that needs print()'s cleanup, and after a
-/// long stretch of one width class, which the vectorized
+/// and a narrow codepoint writes its own cell in the same place. Past
+/// the row's extent, where the cells are zero, they go to the row
+/// directly. Elsewhere they go to a buffer first, so that the cells they
+/// overwrite are cleaned up once, as in printSliceFill, before they are
+/// copied over. It stops at the first codepoint that isn't eligible (zero width, a
+/// grapheme continuation under mode 2027, C0, the Kitty placeholder)
+/// and after a long stretch of one width class, which the vectorized
 /// printSliceFill handles better. The caller resumes with
 /// printSliceFast there.
 fn printSliceMixed(
@@ -1448,11 +1473,10 @@ fn printSliceMixed(
     // ensure that our screen remains in a consistent state.
     defer screen.assertIntegrity();
 
-    // The cell template and expected bits are set per row below.
+    // The cell template is per row, set below.
     var state: PrintSliceMixedRow = .{
         .cps = cps,
         .template_bits = undefined,
-        .check_expected = undefined,
         .prev = prev,
     };
 
@@ -1472,128 +1496,63 @@ fn printSliceMixed(
         // has special handling so leave it the row.
         if (right_limit - self.scrolling_region.left <= 1) break;
 
-        // The style and hyperlink IDs are per page, and a wrap can move
-        // the cursor to another page (which re-interns both), so read
-        // them for every row. `simple` is a simple cell in our style
-        // (see PrintSliceSimpleMask): never linked, even when the cells
-        // we write are.
-        const style_id = cursor.style_id;
-        const link_id = cursor.hyperlink_id;
-        if (comptime linked) {
-            if (link_id == 0) break;
-        } else assert(link_id == 0);
-        const simple: Cell = .{
-            .content_tag = .codepoint,
-            .content = .{ .codepoint = .{ .data = 0 } },
-            .style_id = style_id,
-            .wide = .narrow,
-            .protected = cursor.protected,
-            .semantic_content = cursor.semantic_content,
-        };
-        var template = simple;
-        template.hyperlink = linked;
+        const template = printSliceTemplate(cursor, linked) orelse break;
         state.template_bits = @bitCast(template);
-        state.check_expected = printSliceCheckExpected(style_id);
 
-        state.cells = @ptrCast(cursor.page_cell);
+        // Cells at or right of the row's extent are zero cells (see
+        // Row.extent), which need no cleanup: write into the row directly.
+        // Otherwise fill as much of the rest of the row as the buffer
+        // holds, to clean up the cells it overwrites first.
+        const direct = cursor.x >= cursor.page_row.extent;
+        state.cells = if (direct) @ptrCast(cursor.page_cell) else &state.buf;
         state.avail = right_limit - cursor.x;
+        if (!direct) state.avail = @min(state.avail, state.buf.len);
         state.k = 0;
 
         // The cursor caches live row and cell pointers into this
         // mapping, so its page cannot be compressed while this print
         // path is active.
         const page = cursor.page_pin.node.pageAssumeResident();
-        const styled = style_id != style.default_id;
 
-        // Every cell we write to this row (at most all of it, including
-        // a spacer head at the edge) gets an entry in the page's
-        // hyperlink map, which has a fixed capacity. If the row might
-        // not fit, return: printSliceFill writes what fits and then
-        // print() grows the page (see printSliceFill).
+        // Every cell we write (at most `avail`, or a spacer head at the
+        // edge) gets an entry in the page's hyperlink map, which has a
+        // fixed capacity. If they might not fit, return: printSliceFill
+        // writes what fits and then print() grows the page (see
+        // printSliceFill).
         if (linked and page.hyperlinkCellsFree() < state.avail) break;
-        var stop = state.fill(grapheme_cluster, styled);
-        while (stop == .restyle) {
-            // The next codepoint's cells differ from simple cells by
-            // their style only, or need print(): move their style
-            // references to ours and carry on, or stop. Done here
-            // rather than in fill() so that its loop makes no calls,
-            // which keeps its values in registers.
-            @branchHint(.unlikely);
-            const width: usize = PrintSliceMixedRow.props(cps[state.p]).width;
-            const restyled = state.cells[state.k..][0..width];
-            if (!printSliceRestyle(page, restyled, style_id)) {
-                stop = .done;
-                break;
-            }
+        const stop = state.fill(grapheme_cluster);
 
-            // The references moved; make the cells simple cells in our
-            // style so that fill() accepts and overwrites them.
-            for (restyled) |*cell| cell.* = simple;
-            stop = state.fill(grapheme_cluster, styled);
+        const k = state.k;
+        if (k == 0) {
+            if (stop == .done) break;
+
+            // The next codepoint is wide and only one cell is left in the
+            // row: print() writes a spacer head (or a blank narrow cell if
+            // we're inside a right margin) there and wraps.
+            assert(state.avail == 1);
+            self.printSliceSpacerHead(page, template, right_limit);
+            continue;
         }
 
-        // The cells in the default style we overwrote (or, for
-        // wide_at_edge, are about to) each need a reference to our
-        // style. Before anything that could clone the page.
-        if (styled and state.n_default > 0) {
-            page.styles.useMultiple(
-                page.memory,
+        const style_id = template.style_id;
+        if (direct) {
+            if (style_id != style.default_id) {
+                page.styles.useMultiple(page.memory, style_id, @intCast(k));
+            }
+        } else {
+            self.printSliceClear(
+                page,
+                k,
+                .{ state.buf[0].wide, state.buf[1].wide },
                 style_id,
-                @intCast(state.n_default),
             );
+            const cells: [*]Cell = @ptrCast(cursor.page_cell);
+            @memcpy(cells[0..k], state.buf[0..k]);
         }
-        state.n_default = 0;
+        self.previous_char = @intCast(cps[state.p - 1]);
+        self.printSliceWritten(page, template, k, right_limit);
 
-        // Bookkeeping for the cells we wrote: link them, and move the
-        // cursor past them, onto the last cell with a pending wrap if
-        // the row is full, as in print().
-        if (state.k > 0) {
-            cursor.page_row.markWritten(cursor.x + state.k);
-            if (style_id != style.default_id) cursor.page_row.styled = true;
-            if (linked) page.setHyperlinkRun(
-                cursor.page_row,
-                state.cells[0..state.k],
-                link_id,
-            );
-            self.previous_char = @intCast(cps[state.p - 1]);
-            if (state.k == state.avail) {
-                screen.cursorRight(@intCast(state.k - 1));
-                cursor.pending_wrap = true;
-            } else {
-                screen.cursorRight(@intCast(state.k));
-            }
-        }
-
-        switch (stop) {
-            // The next codepoint is eligible and goes on the next row.
-            .row_full => {},
-
-            // A wide codepoint with one cell left in the row: print()
-            // writes a spacer head (or a blank narrow cell if we're
-            // inside a right margin) there and wraps. fill() checked
-            // that the cell is simple, in our style or the default one.
-            .wide_at_edge => {
-                var spacer = template;
-                if (right_limit == self.cols) {
-                    cursor.page_row.wrap = true;
-                    spacer.wide = .spacer_head;
-                }
-                cursor.page_row.markWritten(cursor.x + 1);
-                if (style_id != style.default_id) cursor.page_row.styled = true;
-                cursor.page_cell.* = spacer;
-                if (linked) page.setHyperlinkRun(
-                    cursor.page_row,
-                    cursor.page_cell[0..1],
-                    link_id,
-                );
-                try self.printWrap();
-            },
-
-            // Handled above.
-            .restyle => unreachable,
-
-            .done => break,
-        }
+        if (stop == .done) break;
     }
 
     return state.p;
@@ -1646,27 +1605,21 @@ inline fn printSliceTransition(
 const PrintSliceMixedRow = struct {
     cps: []const u32,
 
-    /// The narrow cell template (codepoint bits zero) and the expected
-    /// masked bits of a simple cell (see printSliceCheckExpected).
+    /// The narrow cell template (codepoint bits zero).
     template_bits: u64,
-    check_expected: u64,
 
     /// Codepoints consumed.
     p: usize = 0,
 
-    /// The row being written: cells from the cursor to the right
-    /// limit, how many there are, and how many we wrote.
+    /// The cells for the row (the row itself, or `buf`), how many fit (up
+    /// to the right limit, at most all of `buf`), and how many we wrote.
     cells: [*]Cell = undefined,
+    buf: [256]Cell = undefined,
     avail: usize = 0,
     k: usize = 0,
 
     /// How many codepoints of one width class we wrote in a row.
     same: usize = 0,
-
-    /// How many cells in the default style we overwrote with ours on
-    /// this row. Each needs a reference to our style, which the caller
-    /// adds in one go after the row.
-    n_default: usize = 0,
 
     /// The properties of the last codepoint written (see `props`). Its
     /// grapheme break property is what print() compares the next
@@ -1680,20 +1633,11 @@ const PrintSliceMixedRow = struct {
     const homogeneous_max = 32;
 
     const Stop = enum {
-        /// The next codepoint is eligible but the row is full.
-        row_full,
+        /// The next codepoint is eligible but doesn't fit in `avail`.
+        full,
 
-        /// The next codepoint is wide and only one (simple) cell is
-        /// left in the row.
-        wide_at_edge,
-
-        /// The next codepoint's cells (`width` of them from `k`) aren't
-        /// simple cells in our style or the default one: the caller
-        /// restyles them and calls fill() again, or stops.
-        restyle,
-
-        /// Return to the caller: the end of the slice, a codepoint or
-        /// cell that needs print(), or a homogeneous stretch.
+        /// Return to the caller: the end of the slice, a codepoint
+        /// that needs print(), or a homogeneous stretch.
         done,
     };
 
@@ -1708,34 +1652,26 @@ const PrintSliceMixedRow = struct {
         return p;
     }
 
-    /// Fill the row. The loop makes no calls and, besides the exits,
-    /// its only branches are on the row end and the cell checks, which
-    /// are predictable: the codepoint's width class only selects
-    /// values. Not inlined into the row loop so that its values stay in
-    /// registers rather than competing with the row bookkeeping's.
+    /// Fill `cells`. The loop makes no calls and, besides the exits, its
+    /// only branch is on the end of `cells`, which is predictable:
+    /// the codepoint's width class only selects values. Not inlined into
+    /// the row loop so that its values stay in registers rather than
+    /// competing with the row bookkeeping's.
     fn fill(
         self: *PrintSliceMixedRow,
         grapheme_cluster: bool,
-        styled: bool,
     ) Stop {
-        // Specialized on the mode (whether the break check runs) and on
-        // whether we write a style other than the default, which is
-        // what decides whether cells need style references.
-        return if (grapheme_cluster) (if (styled)
-            @call(.never_inline, fillRow, .{ self, true, true })
+        // Specialized on the mode: whether the break check runs.
+        return if (grapheme_cluster)
+            @call(.never_inline, fillRow, .{ self, true })
         else
-            @call(.never_inline, fillRow, .{ self, true, false })) else (if (styled)
-            @call(.never_inline, fillRow, .{ self, false, true })
-        else
-            @call(.never_inline, fillRow, .{ self, false, false }));
+            @call(.never_inline, fillRow, .{ self, false });
     }
 
     fn fillRow(
         self: *PrintSliceMixedRow,
         comptime grapheme_cluster: bool,
-        comptime styled: bool,
     ) Stop {
-        const SimpleMask = PrintSliceSimpleMask;
         const cp_shift = @bitOffsetOf(Cell, "content");
         const wide_shift = @bitOffsetOf(Cell, "wide");
         comptime assert(@backingInt(Cell.Wide.narrow) == 0);
@@ -1747,19 +1683,15 @@ const PrintSliceMixedRow = struct {
         const template_bits = self.template_bits;
         const spacer_bits = template_bits |
             (@as(u64, @backingInt(Cell.Wide.spacer_tail)) << wide_shift);
-        const check_expected = self.check_expected;
-        if (comptime !styled) assert(check_expected == 0);
         var p = self.p;
         var k = self.k;
         var same = self.same;
         var prev = self.prev;
-        var n_default = self.n_default;
         defer {
             self.p = p;
             self.k = k;
             self.same = same;
             self.prev = prev;
-            self.n_default = n_default;
         }
 
         while (p < cps.len) {
@@ -1788,51 +1720,12 @@ const PrintSliceMixedRow = struct {
             }
             if (eligible == 0) return .done;
             assert(width == 1 or width == 2);
-
-            // The cells we write must be simple cells (see
-            // PrintSliceSimpleMask) in our style, or in the default
-            // style: blank cells and unstyled text, which hold no style
-            // reference, so when ours isn't the default they only need
-            // one to our style, counted here and added by the caller
-            // per row. Anything else (styled text in another style, or
-            // a cell that needs print()'s cleanup) goes back to the
-            // caller. Without a style the two cases are one.
-            if (k + width > avail) {
-                if (k == avail) return .row_full;
-                assert(width == 2 and avail - k == 1);
-                const pattern = SimpleMask.pattern(cells[k]);
-                if (comptime styled) {
-                    if (pattern != check_expected and pattern != 0) return .done;
-                    n_default += @intFromBool(pattern == 0);
-                } else {
-                    if (pattern != 0) return .done;
-                }
-                return .wide_at_edge;
-            }
-
-            const last = k + width - 1;
-            const pattern_k = SimpleMask.pattern(cells[k]);
-            const pattern_last = SimpleMask.pattern(cells[last]);
-            if (comptime styled) {
-                if ((pattern_k != check_expected and pattern_k != 0) or
-                    (pattern_last != check_expected and pattern_last != 0))
-                {
-                    @branchHint(.cold);
-                    return .restyle;
-                }
-
-                // For a narrow codepoint both patterns are the same
-                // cell's.
-                n_default += @intFromBool(pattern_k == 0) +
-                    (@intFromBool(pattern_last == 0) & (width - 1));
-            } else if (pattern_k != 0 or pattern_last != 0) {
-                @branchHint(.cold);
-                return .restyle;
-            }
+            if (k + width > avail) return .full;
 
             // The spacer first: for a narrow codepoint, `last` is `k`
             // and the codepoint's own cell overwrites it. The wide flag
             // is the width minus one.
+            const last = k + width - 1;
             cells[last] = @bitCast(spacer_bits);
             cells[k] = @bitCast(template_bits |
                 (@as(u64, cp) << cp_shift) |
@@ -1848,47 +1741,6 @@ const PrintSliceMixedRow = struct {
         return .done;
     }
 };
-
-/// Prepare `cells` (one codepoint's cells) for printSliceMixed to
-/// overwrite them with the style `style_id` when they are simple cells
-/// (see PrintSliceSimpleMask) apart from their style: their style
-/// references move to `style_id`. Returns false, changing nothing, if
-/// any of them needs print()'s cleanup instead (wide cells and
-/// spacers, grapheme data, hyperlinks).
-///
-/// The cursor caches live row and cell pointers into `page`'s mapping,
-/// so it cannot be compressed while this print path is active.
-fn printSliceRestyle(
-    page: *pagepkg.Page,
-    cells: []const Cell,
-    style_id: style.Id,
-) bool {
-    const style_shift = @bitOffsetOf(Cell, "style_id");
-    for (cells) |cell| {
-        const bits = PrintSliceSimpleMask.pattern(cell);
-        const old: style.Id = @truncate(bits >> style_shift);
-        if (bits != printSliceCheckExpected(old)) return false;
-    }
-    for (cells) |cell| {
-        if (cell.style_id == style_id) continue;
-        if (cell.style_id != style.default_id) {
-            page.styles.release(page.memory, cell.style_id);
-        }
-        if (style_id != style.default_id) {
-            page.styles.use(page.memory, style_id);
-        }
-    }
-    return true;
-}
-
-/// The expected value of a simple cell (per SimpleMask in
-/// printSliceFill) that already has the given style (so no
-/// ref-counting is needed).
-inline fn printSliceCheckExpected(style_id: style.Id) u64 {
-    var e: Cell = @bitCast(@as(u64, 0));
-    e.style_id = style_id;
-    return @bitCast(e);
-}
 
 pub fn print(self: *Terminal, c: u21) !void {
     // log.debug("print={x} y={} x={}", .{ c, self.screens.active.cursor.y, self.screens.active.cursor.x });
@@ -16358,7 +16210,7 @@ fn testPrintSliceDifferential(
     var last_n: usize = 0;
 
     for (0..ops) |_| {
-        switch (rand.intRangeAtMost(u8, 0, 21)) {
+        switch (rand.intRangeAtMost(u8, 0, 22)) {
             // Print a run of codepoints (most common op).
             0...9 => {
                 const n = rand.intRangeAtMost(usize, 1, cps_buf.len);
@@ -16391,7 +16243,7 @@ fn testPrintSliceDifferential(
                 t2.setCursorPos(row, col);
             },
             12 => {
-                const attr: sgr.Attribute = switch (rand.intRangeAtMost(u8, 0, 3)) {
+                const attr: sgr.Attribute = switch (rand.intRangeAtMost(u8, 0, 5)) {
                     0 => .{ .unset = {} },
                     1 => .{ .bold = {} },
                     2 => .{ .direct_color_fg = .{
@@ -16400,6 +16252,14 @@ fn testPrintSliceDifferential(
                         .b = rand.int(u8),
                     } },
                     3 => .{ .@"8_fg" = .red },
+                    // Background colors, so that erasing below leaves
+                    // background color cells (palette and RGB).
+                    4 => .{ .@"8_bg" = .blue },
+                    5 => .{ .direct_color_bg = .{
+                        .r = rand.int(u8),
+                        .g = rand.int(u8),
+                        .b = rand.int(u8),
+                    } },
                     else => unreachable,
                 };
                 try t1.setAttribute(attr);
@@ -16477,6 +16337,21 @@ fn testPrintSliceDifferential(
                 t1.setCursorPos(row, col);
                 t2.setCursorPos(row, col);
             },
+            22 => {
+                // Erase part of the line, so that slices overwrite blank
+                // cells, or background color cells if the cursor has a
+                // background color.
+                if (rand.boolean()) {
+                    const modes = [_]csi.EraseLine{ .right, .left, .complete };
+                    const mode = modes[rand.intRangeLessThan(usize, 0, modes.len)];
+                    t1.eraseLine(mode, false);
+                    t2.eraseLine(mode, false);
+                } else {
+                    const n = rand.intRangeAtMost(usize, 1, cols);
+                    t1.eraseChars(n);
+                    t2.eraseChars(n);
+                }
+            },
             else => unreachable,
         }
 
@@ -16549,10 +16424,12 @@ fn testPrintSliceDifferential(
 /// print() and one through printSlice(), hold the same cells and the same
 /// hyperlinks on every row of the screen, scrollback included: per cell
 /// the same link (URI and ID) or none, with the same reference count, the
-/// same row hyperlink flags, and pages that pass the integrity check.
+/// same row hyperlink flags, the same style reference counts, and pages
+/// that pass the integrity check.
 ///
 /// The reference counts are compared exactly because a count that is too
-/// high is not visible until a page is cloned or a link is never freed.
+/// high is not visible until a page is cloned or a link or style is never
+/// freed: the integrity check only requires enough references.
 fn testPrintSliceExpectSameLinks(t1: *Terminal, t2: *Terminal) !void {
     const pages1 = &t1.screens.active.pages;
     const pages2 = &t2.screens.active.pages;
@@ -16598,6 +16475,18 @@ fn testPrintSliceExpectSameLinks(t1: *Terminal, t2: *Terminal) !void {
         try n1.page().verifyIntegrity(testing.allocator);
         try n2.page().verifyIntegrity(testing.allocator);
         try testing.expectEqual(n1.page().hyperlinkCapacity(), n2.page().hyperlinkCapacity());
+
+        // The cells hold the same style IDs (compared above), so the
+        // same IDs must have the same references.
+        const styles1 = &n1.page().styles;
+        const styles2 = &n2.page().styles;
+        try testing.expectEqual(styles1.layout.cap, styles2.layout.cap);
+        for (1..styles1.layout.cap) |id| {
+            try testing.expectEqual(
+                styles1.refCount(n1.page().memory, @intCast(id)),
+                styles2.refCount(n2.page().memory, @intCast(id)),
+            );
+        }
     }
     try testing.expect(it2 == null);
 }
@@ -16750,35 +16639,122 @@ test "Terminal: printSlice with hyperlink onto a new page mid-slice" {
     }
 }
 
-test "Terminal: printSlice over linked cells matches print" {
-    // Overwriting linked cells with the same link, another link, and no
-    // link (all on the print() fallback for the linked old cells).
+test "Terminal: printSlice over other cells matches print" {
+    // Narrow, wide and mixed-width text over cells that need cleanup or
+    // none: cells in other styles (with wide codepoints over two of
+    // them), wide pairs in step and out of step, background color cells,
+    // a grapheme cell, linked cells, and a pair wrapped from the row
+    // above, which ends in its spacer head. From the second column, wide
+    // text meets the last column with one cell left. The cursor is in the
+    // default style, an old one or a new one.
     const Setup = struct {
-        fn printLinked(t: *Terminal) !void {
+        fn styles(t: *Terminal) !void {
+            // Runs of 1, 2 and 3 cells in the default style, green and
+            // red, so that runs end inside and between codepoints.
+            const attrs = [_]?sgr.Attribute{
+                null,
+                .{ .@"8_fg" = .green },
+                .{ .@"8_fg" = .green },
+                .{ .@"8_fg" = .red },
+                .{ .@"8_fg" = .red },
+                .{ .@"8_fg" = .red },
+            };
+            for (0..3) |_| for (attrs) |attr| {
+                try t.setAttribute(attr orelse .{ .unset = {} });
+                try t.print('x');
+            };
+        }
+        fn pairs(t: *Terminal) !void {
+            // The widths of `mixed`, in red.
+            try t.setAttribute(.{ .@"8_fg" = .red });
+            for (mixed) |cp| try t.print(@intCast(cp));
+        }
+        fn twoStyles(t: *Terminal) !void {
+            // Wide pairs in red and then blue. Under `wide` from the
+            // first column, the style changes within a group of cells,
+            // and the last pair is past the last whole group.
+            try t.setAttribute(.{ .@"8_fg" = .red });
+            for (0..3) |_| try t.print(0x4E00);
+            try t.setAttribute(.{ .@"8_fg" = .blue });
+            for (0..6) |_| try t.print(0x4E01);
+        }
+        fn shifted(t: *Terminal) !void {
+            // Wide pairs from the fifth column, which `mixed` reaches out
+            // of step once it is past its first width change.
+            try t.setAttribute(.{ .@"8_fg" = .red });
+            for (0..4) |_| try t.print('x');
+            for (0..7) |_| try t.print(0x4E00);
+        }
+        fn background(t: *Terminal) !void {
+            try t.setAttribute(.{ .@"8_bg" = .blue });
+            t.eraseLine(.complete, false);
+        }
+        fn grapheme(t: *Terminal) !void {
+            // A narrow grapheme cell under the first narrow codepoint of
+            // `mixed`, in a row of background color cells.
+            try background(t);
+            t.setCursorPos(2, 3);
+            try t.print('e');
+            try t.print(0x301);
+        }
+        fn wrapped(t: *Terminal) !void {
+            // Wide pairs from the first column, the first of them wrapped
+            // from the last column of the row above.
+            t.setCursorPos(1, 18);
+            for (0..9) |_| try t.print(0x4E00);
+        }
+        fn linked(t: *Terminal) !void {
+            // Linked cells, written over under the same link.
             try t.screens.active.startHyperlink("http://example.com", null);
             for (0..12) |_| try t.print('o');
             try t.print(0x4E00);
-            t.setCursorPos(1, 3);
         }
-        fn other(t: *Terminal) !void {
-            try printLinked(t);
+        fn otherLink(t: *Terminal) !void {
+            try linked(t);
             try t.screens.active.startHyperlink("http://example.org", null);
         }
-        fn none(t: *Terminal) !void {
-            try printLinked(t);
+        fn unlinked(t: *Terminal) !void {
+            try linked(t);
             t.screens.active.endHyperlink();
         }
+
+        const narrow = [_]u32{ 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's' };
+        const mixed = [_]u32{ 0x4E8C, 'a', 0x4E09, 0x56DB, 'b', 'c', 0x6F22, 'd', 0x5B57 };
+        const wide = [_]u32{ 0x4E00, 0x4E01, 0x4E8C, 0x4E09, 0x56DB, 0x6F22, 0x5B57, 0x4E00, 0x4E01 };
     };
-    const narrow = [_]u32{ 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q' };
-    const mixed = [_]u32{ 'a', 0x4E8C, 'b', 0x4E09, 0x56DB, ' ', 'c', 0x6F22, 'd', 'e', 'f', 'g' };
-    for ([_]*const fn (*Terminal) anyerror!void{
-        Setup.printLinked,
-        Setup.other,
-        Setup.none,
+    const cursor_attrs = [_]?sgr.Attribute{ null, .{ .@"8_fg" = .red }, .{ .@"8_fg" = .blue } };
+    inline for (.{
+        Setup.styles,
+        Setup.pairs,
+        Setup.twoStyles,
+        Setup.shifted,
+        Setup.background,
+        Setup.grapheme,
+        Setup.wrapped,
+        Setup.linked,
+        Setup.otherLink,
+        Setup.unlinked,
     }) |setup| {
-        for ([_][]const u32{ &narrow, &mixed }) |cps| {
-            try testPrintSliceLinked(.{ .cols = 15, .rows = 3 }, setup, cps);
-        }
+        inline for (.{ 1, 2 }) |x| inline for (cursor_attrs) |cursor_attr| {
+            const run = struct {
+                fn run(t: *Terminal) !void {
+                    // The second row, below the spacer head of `wrapped`.
+                    t.setCursorPos(2, 1);
+                    try setup(t);
+                    try t.setAttribute(cursor_attr orelse .{ .unset = {} });
+                    t.setCursorPos(2, x);
+                }
+            }.run;
+            // Twice over, the mixed text meets the last column too.
+            for ([_][]const u32{
+                &Setup.narrow,
+                &Setup.mixed,
+                &(Setup.mixed ++ Setup.mixed),
+                &Setup.wide,
+            }) |cps| {
+                try testPrintSliceLinked(.{ .cols = 18, .rows = 3 }, run, cps);
+            }
+        };
     }
 }
 

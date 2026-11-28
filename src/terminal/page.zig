@@ -1658,12 +1658,13 @@ pub const Page = struct {
 
     /// Link a run of freshly written cells in `row` to the hyperlink `id`:
     /// one map entry per cell and one reference per cell, exactly what
-    /// `setHyperlink` and a `use` per cell would do, in bulk.
+    /// `setHyperlink` and a `use` per cell would do, in bulk. A cell that
+    /// had a hyperlink keeps its map entry, and the old hyperlink's
+    /// reference is released.
     ///
-    /// The cells must already have their hyperlink flag set and must not
-    /// have had a hyperlink before they were written, so none of them has
-    /// a map entry (no old reference to release). The map must have room
-    /// for every cell (see `hyperlinkCellsFree`); it can't grow here.
+    /// The cells must already have their hyperlink flag set. The map must
+    /// have room for every cell (see `hyperlinkCellsFree`); it can't grow
+    /// here.
     pub fn setHyperlinkRun(
         self: *Page,
         row: *Row,
@@ -1675,7 +1676,9 @@ pub const Page = struct {
 
         var map = self.hyperlink_map.map(self.memory);
         for (cells) |*cell| {
-            map.putAssumeCapacityNoClobber(getOffset(Cell, self.memory, cell), id);
+            const gop = map.getOrPutAssumeCapacity(getOffset(Cell, self.memory, cell));
+            if (gop.found_existing) self.hyperlink_set.release(self.memory, gop.value_ptr.*);
+            gop.value_ptr.* = id;
         }
         row.hyperlink = true;
         self.hyperlink_set.useMultiple(self.memory, id, @intCast(cells.len));
@@ -3051,42 +3054,9 @@ pub fn Mask(
             return @reduce(.Or, masked == @as(Group, @splat(expected)));
         }
 
-        /// Like `eql` but returns the number of leading values whose
-        /// masked fields equal the expected pattern, i.e. group_len if
-        /// the entire group matches. This is useful for early-exit run
-        /// scans that need to pinpoint exactly where a run ends rather
-        /// than only whether the whole group matches.
-        pub inline fn eqlPrefix(
-            values: []const T,
-            i: usize,
-            expected: Backing,
-        ) usize {
-            const masked = load(values, i) & @as(Group, @splat(mask));
-            const ok = masked == @as(Group, @splat(expected));
-
-            // Test the whole group before extracting the prefix
-            // count: turning a vector compare into a scalar bitmask
-            // is expensive on some targets (e.g. NEON has no movemask
-            // instruction) and run scans overwhelmingly see fully
-            // matching groups, so we only pay for the extraction on
-            // the final group of a run.
-            if (@reduce(.And, ok)) {
-                @branchHint(.likely);
-                return group_len;
-            }
-
-            const ok_bits: @Int(
-                .unsigned,
-                group_len,
-            ) = @bitCast(ok);
-            return @ctz(~ok_bits);
-        }
-
         /// Returns the index of the first value at or after i whose masked
         /// fields differ from the expected pattern (see `pattern`), or
-        /// values.len if all remaining values match. Unlike `eqlPrefix`,
-        /// this returns an index rather than a count, so a scan can
-        /// continue from it.
+        /// values.len if all remaining values match.
         ///
         /// Runs are often only a value or two long (e.g. syntax
         /// highlighting changes style every few cells), so this checks
@@ -3151,16 +3121,6 @@ test "Mask" {
         cells[1] = other;
         try testing.expect(!M.eql(&cells, 0, expected));
         try testing.expect(!M.eqlScalar(other, expected));
-    }
-
-    // eqlPrefix: count of leading values matching the pattern
-    {
-        const expected = M.pattern(styled);
-        var cells: [4]Cell = .{ styled, styled2, other, styled };
-        try testing.expectEqual(2, M.eqlPrefix(&cells, 0, expected));
-
-        cells[2] = styled;
-        try testing.expectEqual(4, M.eqlPrefix(&cells, 0, expected));
     }
 
     // eqlEnd: end of the run of matching values, across groups
