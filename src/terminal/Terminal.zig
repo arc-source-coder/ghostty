@@ -656,7 +656,10 @@ fn printSliceOf(self: *Terminal, comptime Cp: type, cps: []const Cp) !void {
 }
 
 /// The batched part of printSlice, specialized on whether a hyperlink is
-/// open (see there).
+/// open (see there). Runs of narrow codepoints go to printSliceFill. From
+/// the first wide codepoint on, the rest of the slice goes to
+/// printSliceUnicode, which takes codepoints of either width. Codepoints
+/// neither can print go to print().
 fn printSliceBatched(
     self: *Terminal,
     comptime linked: bool,
@@ -667,7 +670,7 @@ fn printSliceBatched(
 
     // When grapheme clustering is enabled and a left margin is set,
     // print() consults the cell left of the margin after wrapping,
-    // which we can't reason about here. Restrict the fast path to
+    // which we can't reason about here. Restrict the fast paths to
     // the [0x10, 0xFF] range in that case (those never cluster).
     const charset = self.screens.active.charset;
     const allow_unicode = switch (charset.charsets.get(charset.gl)) {
@@ -678,217 +681,108 @@ fn printSliceBatched(
 
     var i: usize = 0;
     while (i < cps.len) {
-        // Try the fast-path print first. This will return the number of
-        // codepoints it consumed.
-        const consumed = try self.printSliceFast(
-            linked,
-            Cp,
-            cps[i..],
-            grapheme_cluster,
-            allow_unicode,
-        );
-        if (consumed > 0) {
-            i += consumed;
-
-            // If the batch ended at a width transition, continue with
-            // the mixed-width fill rather than starting a new batch per
-            // run: in text that alternates width classes every few
-            // codepoints (CJK with ASCII spaces, digits and
-            // punctuation) the setup of each batch would dominate.
-            // ASCII is all one width.
-            if (Cp == u32 and i < cps.len) {
-                if (printSliceTransition(
-                    cps[i - 1],
-                    cps[i],
-                    grapheme_cluster,
-                    allow_unicode,
-                )) |prev| {
-                    i += try @call(.never_inline, printSliceMixed, .{
-                        self,
-                        linked,
-                        cps[i..],
-                        prev,
-                        grapheme_cluster,
-                    });
-                }
-            }
+        const cp = cps[i];
+        const width: u2 = if (comptime Cp == u8)
+            1
+        else if (cp >= 0x10 and cp <= 0xFF)
+            1
+        else if (allow_unicode)
+            self.printSliceUnicodeWidth(cp, grapheme_cluster)
+        else
+            0;
+        const printed: usize = switch (width) {
+            1 => try self.printSliceFill(linked, Cp, cps[i..], grapheme_cluster, allow_unicode),
+            2 => try self.printSliceUnicode(linked, cps[i..], grapheme_cluster),
+            else => 0,
+        };
+        if (printed > 0) {
+            i += printed;
             continue;
         }
 
-        // Consuming zero bytes means that the fast path can't handle
-        // the next codepoint or the terminal is in a state we can't
-        // fast-path. Fall back to the slow cp-by-cp print then try
-        // fast paths again.
-        try self.print(@intCast(cps[i]));
+        // Neither fast path can print the next codepoint (or the
+        // terminal is in a state they can't handle): print it with the
+        // slow cp-by-cp print, then try the fast paths again.
+        try self.print(@intCast(cp));
         i += 1;
     }
 }
 
-/// Attempt to print a prefix of `cps` using a batched fast path that
-/// writes cells directly. Returns the number of codepoints consumed.
-/// A return value of zero means the caller must print the first
-/// codepoint via the normal `print` path.
-///
-/// The fast path handles runs of narrow (width 1) and wide (width 2)
-/// codepoints being written to simple cells. Everything else (zero
-/// width codepoints, grapheme cluster continuations, complex cells,
-/// etc.) is rejected so `print` can handle it with full generality.
-fn printSliceFast(
-    self: *Terminal,
-    comptime linked: bool,
-    comptime Cp: type,
-    cps: []const Cp,
-    grapheme_cluster: bool,
-    allow_unicode: bool,
-) !usize {
-    // Printable ASCII is always narrow and eligible.
-    if (comptime Cp == u8) return self.printSliceFill(
-        .narrow,
-        linked,
-        Cp,
-        cps,
-        grapheme_cluster,
-        allow_unicode,
-    );
-
-    const screen: *Screen = self.screens.active;
-
-    // Codepoints in [0x10, 0xFF] are always narrow (width 1, matching
-    // the c <= 0xFF fast path in print) and can never interact with
-    // grapheme clustering (which requires a codepoint > 0xFF).
-    //
-    // Codepoints above 0xFF are batchable if their width is 1 or 2
-    // (excluding zero-width characters such as combining marks, ZWJ,
-    // and variation selectors) and, when grapheme clustering (mode
-    // 2027) is enabled, if they are a grapheme break from the
-    // previously printed codepoint (so print would never attach them
-    // to the previous cell).
-
-    // Codepoints in [0x10, 0xFF] are always narrow: print()
-    // hardcodes width 1 for c <= 0xFF (no width table lookup).
-    // They also can never interact with grapheme clustering,
-    // which print() only performs for c > 0xFF, so they're
-    // immediately eligible for the narrow fill with no further
-    // checks.
-    const cp0 = cps[0];
-    if (cp0 <= 0xFF) {
-        // C0 control characters (0x00-0x0F) aren't printable. The
-        // stream never sends these (they're routed to execute), but
-        // printSlice is a public API so defer to print() for safety.
-        if (cp0 < 0x10) return 0;
-        return self.printSliceFill(
-            .narrow,
-            linked,
-            Cp,
-            cps,
-            grapheme_cluster,
-            allow_unicode,
-        );
-    }
-
-    if (!allow_unicode) return 0;
-    if (comptime build_options.kitty_graphics) {
-        // The Kitty graphics placeholder requires row bookkeeping.
-        if (cp0 == kitty.graphics.unicode.placeholder) return 0;
-    }
-
-    // The first codepoint requires care when grapheme clustering is
-    // enabled: print() may attach it to the previous *cell* instead
-    // of writing a new one. Take the first codepoint only when we can
-    // determine — computing exactly what print() would — that it
-    // starts a new cluster. At column zero with no pending wrap,
-    // print() skips clustering entirely. Otherwise resolve the
-    // previous cell the way print() does and check for a break.
-    //
-    // Note the pending-wrap rejection: print() may attach to the
-    // pending cell *instead of wrapping*, which we can't model here.
-    if (grapheme_cluster and screen.cursor.x != 0) gate: {
-        if (screen.cursor.pending_wrap) return 0;
-
-        // Resolve the content cell to our left exactly like print():
-        // if the immediate left cell is a wide spacer tail, the
-        // content lives one further left. (A spacer tail can never
-        // be at column zero — its wide half would have to be in the
-        // previous row — so the second cursorCellLeft is in bounds.)
-        const immediate = screen.cursorCellLeft(1);
-        const prev: *Cell = switch (immediate.wide) {
-            .spacer_tail => screen.cursorCellLeft(2),
-            else => immediate,
-        };
-
-        // An empty previous cell is necessarily a grapheme break.
-        if (prev.codepoint() == 0) break :gate;
-
-        // Grapheme data on the previous cell requires the full
-        // cluster state machine replay; only print() can do that.
-        if (prev.hasGrapheme()) return 0;
-
-        // A simple single-codepoint previous cell: print() would run
-        // exactly this break check from the default state.
-        var state: uucode.grapheme.BreakState = .default;
-        if (!unicode.graphemeBreak(
-            unicode.table.get(prev.content.codepoint.data).grapheme_break,
-            unicode.table.get(@intCast(cp0)).grapheme_break,
-            &state,
-        )) return 0;
-    } else if (grapheme_cluster) {
-        if (screen.cursor.pending_wrap) return 0;
-    }
-
-    // The width lookup is a runtime value while printSliceFill is
-    // specialized at comptime by width class, so this switch selects
-    // between the two instantiations rather than passing the width
-    // through as an argument.
-    return switch (unicode.table.get(@intCast(cp0)).width) {
-        1 => self.printSliceFill(
-            .narrow,
-            linked,
-            Cp,
-            cps,
-            grapheme_cluster,
-            allow_unicode,
-        ),
-        2 => self.printSliceFill(
-            .wide,
-            linked,
-            Cp,
-            cps,
-            grapheme_cluster,
-            allow_unicode,
-        ),
-        else => 0,
-    };
+/// The properties print() uses for a codepoint: those of the table,
+/// except that codepoints up to 0xFF are always width 1 (print() doesn't
+/// look them up).
+inline fn printSliceProps(cp: u32) unicode.Properties {
+    var p = unicode.table.get(@intCast(cp));
+    if (cp <= 0xFF) p.width = 1;
+    return p;
 }
 
-/// The width class of a printSlice batch. Each batch contains only
-/// codepoints of a single width class because they fill cells
-/// differently: wide codepoints occupy a (wide, spacer_tail) cell
-/// pair while narrow codepoints occupy a single cell.
-const PrintSliceWidth = enum(u1) {
-    narrow,
-    wide,
-
-    /// The number of cells each codepoint of this width class occupies.
-    fn cellsPerCp(comptime self: PrintSliceWidth) usize {
-        return switch (self) {
-            .narrow => 1,
-            .wide => 2,
-        };
-    }
-};
-
-/// Whether a codepoint above 0xFF is eligible for the batched print
-/// fast path with the given width class.
-inline fn printSliceEligible(cp: u32, comptime width: PrintSliceWidth) bool {
-    assert(cp > 0xFF);
+/// The width of the new cell print() would write `cp`, which is outside
+/// [0x10, 0xFF], to at the cursor, or 0 if print() needs to print it
+/// itself. Zero width codepoints (combining marks, ZWJ, variation
+/// selectors), C0 and the Kitty placeholder need print(). Under mode
+/// 2027, so does a codepoint that print() may attach to the previous
+/// cell: one that doesn't break from it, one after grapheme data, which
+/// only print()'s cluster state machine can replay, and any codepoint at
+/// a pending wrap, where print() may attach it to the pending cell
+/// instead of wrapping.
+fn printSliceUnicodeWidth(self: *Terminal, cp: u32, grapheme_cluster: bool) u2 {
+    if (cp < 0x10) return 0;
     if (comptime build_options.kitty_graphics) {
-        if (cp == kitty.graphics.unicode.placeholder) return false;
+        if (cp == kitty.graphics.unicode.placeholder) return 0;
     }
+    const props = printSliceProps(cp);
+    if (props.width == 0 or !grapheme_cluster) return props.width;
 
-    return unicode.table.get(@intCast(cp)).width == comptime @as(u2, switch (width) {
-        .narrow => 1,
-        .wide => 2,
-    });
+    const screen: *Screen = self.screens.active;
+    if (screen.cursor.pending_wrap) return 0;
+
+    // At column zero print() skips clustering.
+    if (screen.cursor.x == 0) return props.width;
+
+    // Resolve the content cell to our left exactly like print(): if the
+    // immediate left cell is a wide spacer tail, the content lives one
+    // further left. (A spacer tail can never be at column zero — its
+    // wide half would have to be in the previous row — so the second
+    // cursorCellLeft is in bounds.)
+    const immediate = screen.cursorCellLeft(1);
+    const prev: *Cell = switch (immediate.wide) {
+        .spacer_tail => screen.cursorCellLeft(2),
+        else => immediate,
+    };
+    if (prev.codepoint() == 0) return props.width;
+    if (prev.hasGrapheme()) return 0;
+    var state: uucode.grapheme.BreakState = .default;
+    const brk = unicode.graphemeBreak(
+        printSliceProps(prev.content.codepoint.data).grapheme_break,
+        props.grapheme_break,
+        &state,
+    );
+    return if (brk) props.width else 0;
+}
+
+/// Whether print() would write `cp`, of properties `cur`, to a new cell
+/// right after writing a codepoint of properties `prev` to one: unless
+/// it is zero width, C0 or the Kitty placeholder, or, under mode 2027,
+/// doesn't break from `prev` (print() never clusters codepoints up to
+/// 0xFF). Bitwise rather than short-circuit so that no branch depends on
+/// the codepoint.
+inline fn printSliceNext(
+    grapheme_cluster: bool,
+    cp: u32,
+    prev: unicode.Properties,
+    cur: unicode.Properties,
+) bool {
+    var next = @intFromBool(cp >= 0x10) & @intFromBool(cur.width != 0);
+    if (comptime build_options.kitty_graphics) {
+        next &= @intFromBool(cp != kitty.graphics.unicode.placeholder);
+    }
+    if (grapheme_cluster) {
+        var state: uucode.grapheme.BreakState = .default;
+        const brk = unicode.graphemeBreak(prev.grapheme_break, cur.grapheme_break, &state);
+        next &= @intFromBool(brk) | @intFromBool(cp <= 0xFF);
+    }
+    return next != 0;
 }
 
 /// Store narrow cells using a template with zeroed codepoint bits.
@@ -1148,13 +1042,15 @@ fn printSliceClearSlow(
     }
 }
 
-/// The row-filling portion of the printSlice fast path, specialized by
-/// width class and by whether the cells written are linked to the
-/// cursor's hyperlink. The first codepoint must already be validated by
-/// the caller (printSliceFast).
+/// The printSlice fast path for a run of narrow codepoints (for bytes,
+/// all of `cps`, which are printable ASCII), specialized by whether the
+/// cells written are linked to the cursor's hyperlink. The caller
+/// checked that print() would write the first to a new narrow cell (see
+/// printSliceUnicodeWidth). Returns the number of codepoints printed:
+/// none if the hyperlink map is full, which print() grows for the next
+/// one.
 fn printSliceFill(
     self: *Terminal,
-    comptime width: PrintSliceWidth,
     comptime linked: bool,
     comptime Cp: type,
     cps: []const Cp,
@@ -1167,17 +1063,9 @@ fn printSliceFill(
         else => |set| charsets.table(set),
     };
     assert(charset_table == null or !allow_unicode);
-
     const cursor = &screen.cursor;
 
-    // Determine the run of codepoints in the same width class that we
-    // can batch. For codepoints after the first, the previous codepoint
-    // in the run is always written as a fresh, single-codepoint cell,
-    // so the grapheme break check against it is exact.
     const run_len: usize = if (comptime Cp == u8) ascii: {
-        // Printable ASCII is always narrow and eligible: one run with
-        // nothing to scan.
-        comptime assert(width == .narrow);
         if (comptime std.debug.runtime_safety) {
             for (cps) |cp| assert(cp >= 0x20 and cp <= 0x7F);
         }
@@ -1185,56 +1073,40 @@ fn printSliceFill(
     } else run: {
         var idx: usize = 1;
 
-        // Vectorized scan for the narrow class: codepoints in
-        // [0x10, 0xFF] are always eligible with no further checks
-        // and dominate real-world input, so scan for the first
-        // codepoint outside that range several lanes at a time.
-        // Anything else (including eligible unicode) proceeds via
-        // the scalar loop below.
-        if (comptime width == .narrow) {
-            if (simd.lanes(u32)) |lanes| {
-                const V = @Vector(lanes, u32);
-                const lo: V = @splat(0x10);
-                const hi: V = @splat(0xFF);
-                while (idx + lanes <= cps.len) {
-                    const v: V = cps[idx..][0..lanes].*;
-                    const in_range = (v >= lo) & (v <= hi);
-                    if (!@reduce(.And, in_range)) {
-                        const bits: @Int(.unsigned, lanes) = @bitCast(in_range);
-                        idx += @ctz(~bits);
-                        break;
-                    }
-                    idx += lanes;
+        // Codepoints in [0x10, 0xFF], which dominate most text, are
+        // narrow and never cluster (print() only clusters codepoints
+        // above 0xFF), so they need no lookups. This is an early-exit
+        // search loop that LLVM won't auto-vectorize, so scan for the
+        // first one outside that range several lanes at a time manually.
+        if (simd.lanes(u32)) |lanes| {
+            const V = @Vector(lanes, u32);
+            const lo: V = @splat(0x10);
+            const hi: V = @splat(0xFF);
+            while (idx + lanes <= cps.len) {
+                const v: V = cps[idx..][0..lanes].*;
+                const in_range = (v >= lo) & (v <= hi);
+                if (!@reduce(.And, in_range)) {
+                    const bits: @Int(.unsigned, lanes) = @bitCast(in_range);
+                    idx += @ctz(~bits);
+                    break;
                 }
+                idx += lanes;
             }
         }
-
         while (idx < cps.len) : (idx += 1) {
             const cp = cps[idx];
-            if (comptime width == .narrow) {
-                if (cp >= 0x10 and cp <= 0xFF) continue;
-            }
-            if (cp > 0xFF and allow_unicode and printSliceEligible(cp, width)) {
-                if (!grapheme_cluster) continue;
-                var state: uucode.grapheme.BreakState = .default;
-                if (unicode.graphemeBreak(
-                    unicode.table.get(@intCast(cps[idx - 1])).grapheme_break,
-                    unicode.table.get(@intCast(cp)).grapheme_break,
-                    &state,
-                )) continue;
-            }
-            break :run idx;
+            if (cp >= 0x10 and cp <= 0xFF) continue;
+            if (!allow_unicode) break;
+            const cur = printSliceProps(cp);
+            const prev = printSliceProps(cps[idx - 1]);
+            if (cur.width != 1 or !printSliceNext(grapheme_cluster, cp, prev, cur)) break;
         }
-        break :run cps.len;
+        break :run idx;
     };
-    assert(run_len > 0);
 
     // After doing any printing, wrapping, scrolling, etc. we want to
     // ensure that our screen remains in a consistent state.
     defer screen.assertIntegrity();
-
-    // The number of cells each codepoint occupies.
-    const cells_per_cp: usize = comptime width.cellsPerCp();
 
     var printed: usize = 0;
     while (printed < run_len) {
@@ -1248,37 +1120,15 @@ fn printSliceFill(
             self.cols
         else
             self.scrolling_region.right + 1;
-
-        // A degenerate 1-wide region can't hold a wide char; print()
-        // has special handling so fall back to it.
-        if (comptime width == .wide) {
-            if (right_limit - self.scrolling_region.left <= 1) break;
-        }
-
         const avail: usize = right_limit - cursor.x;
         assert(avail > 0);
 
         // The cursor caches live row and cell pointers into this mapping, so
         // its page cannot be compressed while this print path is active.
         const page = cursor.page_pin.node.pageAssumeResident();
-        const cells: [*]Cell = @ptrCast(cursor.page_cell);
         const template = printSliceTemplate(cursor, linked) orelse break;
 
-        if (comptime width == .wide) {
-            if (avail == 1) {
-                // Only one cell left in the row: print() writes a
-                // spacer head (or a blank narrow cell if we're inside
-                // a right margin) over it and wraps. print() links the
-                // spacer head too. If the hyperlink map is full, print()
-                // grows the page for it.
-                if (linked and page.hyperlinkCellsFree() == 0) break;
-                self.printSliceSpacerHead(page, template, right_limit);
-                continue;
-            }
-        }
-
-        // Number of codepoints and cells we're writing to this row.
-        var count = @min(avail / cells_per_cp, run_len - printed);
+        var count = @min(avail, run_len - printed);
         if (comptime linked) {
             // Every cell we write gets an entry in the page's hyperlink
             // map, which has a fixed capacity: write only what fits.
@@ -1286,77 +1136,23 @@ fn printSliceFill(
             // codepoint, which grows the page for its link
             // (Screen.cursorSetHyperlink). Growing here would replace
             // the page under the pointers we hold.
-            count = @min(count, page.hyperlinkCellsFree() / cells_per_cp);
+            count = @min(count, page.hyperlinkCellsFree());
             if (count == 0) break;
         }
-        assert(count > 0);
-        const cell_count = count * cells_per_cp;
 
-        self.printSliceClear(page, cell_count, switch (width) {
-            .narrow => .{ .narrow, .narrow },
-            .wide => .{ .wide, .spacer_tail },
-        }, template.style_id);
-
-        if (comptime width == .wide) {
-            // Wide cells always come in (wide, spacer_tail) pairs.
-            var wide = template;
-            wide.wide = .wide;
-            var spacer = template;
-            spacer.wide = .spacer_tail;
-            const wide_bits: u64 = @bitCast(wide);
-            const spacer_bits: u64 = @bitCast(spacer);
-
-            // The bit offset of the codepoint content within a Cell, used
-            // to construct cell values from a template without field
-            // assignments.
-            const cp_shift = @bitOffsetOf(Cell, "content");
-
-            var idx: usize = 0;
-
-            // Manually vectorized for the same reason as
-            // printSliceStoreRun: build a vector of wide cells,
-            // interleave with spacer tails, and store (wide,
-            // spacer) pairs several at a time.
-            if (simd.lanes(u64)) |lanes| {
-                const pair_lanes = lanes / 2;
-                const Vp = @Vector(pair_lanes, u64);
-                const wide_v: Vp = @splat(wide_bits);
-                const spacer_v: Vp = @splat(spacer_bits);
-                const shift_v: @Vector(
-                    pair_lanes,
-                    std.math.Log2Int(u64),
-                ) = @splat(cp_shift);
-                while (idx + lanes <= cell_count) : (idx += lanes) {
-                    const narrow: @Vector(pair_lanes, u32) =
-                        cps[printed + idx / 2 ..][0..pair_lanes].*;
-                    const wides: Vp = wide_v | (@as(Vp, @intCast(narrow)) << shift_v);
-                    const pairs: [lanes]u64 = std.simd.interlace(.{
-                        wides,
-                        spacer_v,
-                    });
-                    cells[idx..][0..lanes].* = @bitCast(pairs);
-                }
-            }
-            while (idx < cell_count) : (idx += 2) {
-                const cp: u64 = cps[printed + idx / 2];
-                cells[idx] = @bitCast(wide_bits | (cp << cp_shift));
-                cells[idx + 1] = @bitCast(spacer_bits);
-            }
-        } else {
-            printSliceStoreRun(
-                cells,
-                Cp,
-                cps.ptr + printed,
-                0,
-                cell_count,
-                @bitCast(template),
-                charset_table,
-            );
-        }
-
+        self.printSliceClear(page, count, .{ .narrow, .narrow }, template.style_id);
+        printSliceStoreRun(
+            @ptrCast(cursor.page_cell),
+            Cp,
+            cps.ptr + printed,
+            0,
+            count,
+            @bitCast(template),
+            charset_table,
+        );
         self.previous_char = @intCast(cps[printed + count - 1]);
         printed += count;
-        self.printSliceWritten(page, template, cell_count, right_limit);
+        self.printSliceWritten(page, template, count, right_limit);
     }
 
     return printed;
@@ -1436,30 +1232,19 @@ fn printSliceSpacerHead(
     self.printSliceWritten(page, template, 1, right_limit);
 }
 
-/// The printSlice fast path for codepoints of both width classes
-/// mixed together. Returns the number of codepoints consumed. The first
-/// codepoint must already be validated as eligible (see
-/// printSliceTransition), which also implies Unicode is allowed and
-/// no charset mapping applies. `prev` is the properties of the codepoint
-/// printed right before the slice, which the grapheme break of the first
-/// codepoint was checked against.
+/// The printSlice fast path from a wide codepoint on, for codepoints of
+/// either width, specialized by whether the cells written are linked to
+/// the cursor's hyperlink. The caller checked that print() would write
+/// the first codepoint to a new cell (see printSliceUnicodeWidth).
+/// Returns the number of codepoints printed.
 ///
-/// This writes one codepoint at a time without branching on its
-/// width: a wide codepoint's spacer tail goes to the cell after it,
-/// and a narrow codepoint writes its own cell in the same place. Past
-/// the row's extent, where the cells are zero, they go to the row
-/// directly. Elsewhere they go to a buffer first, so that the cells they
-/// overwrite are cleaned up once, as in printSliceFill, before they are
-/// copied over. It stops at the first codepoint that isn't eligible (zero width, a
-/// grapheme continuation under mode 2027, C0, the Kitty placeholder)
-/// and after a long stretch of one width class, which the vectorized
-/// printSliceFill handles better. The caller resumes with
-/// printSliceFast there.
-fn printSliceMixed(
+/// Each row takes two passes: printSliceClassify finds the codepoints
+/// that fit and their widths, then the cells they overwrite are cleaned
+/// up, as in printSliceFill, and the new cells stored.
+fn printSliceUnicode(
     self: *Terminal,
     comptime linked: bool,
     cps: []const u32,
-    prev: unicode.Properties,
     grapheme_cluster: bool,
 ) !usize {
     const screen: *Screen = self.screens.active;
@@ -1473,18 +1258,12 @@ fn printSliceMixed(
     // ensure that our screen remains in a consistent state.
     defer screen.assertIntegrity();
 
-    // The cell template is per row, set below.
-    var state: PrintSliceMixedRow = .{
-        .cps = cps,
-        .template_bits = undefined,
-        .prev = prev,
-    };
-
-    while (state.p < cps.len) {
-        // The caller validated cps[0], and each row below stops only
-        // after classifying the codepoint it stops at, so a pending
-        // wrap here is followed by an eligible codepoint: print()
-        // would wrap for it.
+    var widths: [256]u8 = undefined;
+    var p: usize = 0;
+    while (p < cps.len) {
+        // The caller checked the first codepoint, and each row stops only
+        // after checking the codepoint it stops at, so a pending wrap here
+        // is followed by a codepoint we print: print() would wrap for it.
         if (cursor.pending_wrap) try self.printWrap();
 
         const right_limit: usize = if (cursor.x > self.scrolling_region.right)
@@ -1496,251 +1275,179 @@ fn printSliceMixed(
         // has special handling so leave it the row.
         if (right_limit - self.scrolling_region.left <= 1) break;
 
-        const template = printSliceTemplate(cursor, linked) orelse break;
-        state.template_bits = @bitCast(template);
-
-        // Cells at or right of the row's extent are zero cells (see
-        // Row.extent), which need no cleanup: write into the row directly.
-        // Otherwise fill as much of the rest of the row as the buffer
-        // holds, to clean up the cells it overwrites first.
-        const direct = cursor.x >= cursor.page_row.extent;
-        state.cells = if (direct) @ptrCast(cursor.page_cell) else &state.buf;
-        state.avail = right_limit - cursor.x;
-        if (!direct) state.avail = @min(state.avail, state.buf.len);
-        state.k = 0;
-
         // The cursor caches live row and cell pointers into this
         // mapping, so its page cannot be compressed while this print
         // path is active.
         const page = cursor.page_pin.node.pageAssumeResident();
+        const template = printSliceTemplate(cursor, linked) orelse break;
 
-        // Every cell we write (at most `avail`, or a spacer head at the
-        // edge) gets an entry in the page's hyperlink map, which has a
-        // fixed capacity. If they might not fit, return: printSliceFill
-        // writes what fits and then print() grows the page (see
-        // printSliceFill).
-        if (linked and page.hyperlinkCellsFree() < state.avail) break;
-        const stop = state.fill(grapheme_cluster);
+        // Every cell we write gets an entry in the page's hyperlink map,
+        // which has a fixed capacity: write only what fits, and return
+        // when nothing does (see printSliceFill).
+        const row_left = right_limit - cursor.x;
+        var avail = @min(row_left, widths.len);
+        if (comptime linked) {
+            avail = @min(avail, page.hyperlinkCellsFree());
+            if (avail == 0) break;
+        }
 
-        const k = state.k;
-        if (k == 0) {
-            if (stop == .done) break;
-
-            // The next codepoint is wide and only one cell is left in the
-            // row: print() writes a spacer head (or a blank narrow cell if
-            // we're inside a right margin) there and wraps.
-            assert(state.avail == 1);
+        const row = printSliceClassify(grapheme_cluster, cps[p..], avail, &widths);
+        if (row.n == 0) {
+            // The next codepoint is wide and only one cell is left. If
+            // that's the row's, print() writes a spacer head (or a blank
+            // narrow cell if we're inside a right margin) there and wraps.
+            // If it's the hyperlink map's, print() grows the page.
+            if (avail < row_left) break;
             self.printSliceSpacerHead(page, template, right_limit);
             continue;
         }
 
-        const style_id = template.style_id;
-        if (direct) {
-            if (style_id != style.default_id) {
-                page.styles.useMultiple(page.memory, style_id, @intCast(k));
-            }
-        } else {
-            self.printSliceClear(
-                page,
-                k,
-                .{ state.buf[0].wide, state.buf[1].wide },
-                style_id,
-            );
-            const cells: [*]Cell = @ptrCast(cursor.page_cell);
-            @memcpy(cells[0..k], state.buf[0..k]);
-        }
-        self.previous_char = @intCast(cps[state.p - 1]);
-        self.printSliceWritten(page, template, k, right_limit);
+        const first_wide = widths[0] == 2;
+        self.printSliceClear(page, row.cells, .{
+            if (first_wide) .wide else .narrow,
+            if (first_wide) .spacer_tail else if (row.n > 1 and widths[1] == 2) .wide else .narrow,
+        }, template.style_id);
+        printSliceStoreUnicode(@ptrCast(cursor.page_cell), cps[p..][0..row.n], widths[0..row.n], row, template);
+        self.previous_char = @intCast(cps[p + row.n - 1]);
+        p += row.n;
+        self.printSliceWritten(page, template, row.cells, right_limit);
 
-        if (stop == .done) break;
+        if (row.done) break;
     }
 
-    return state.p;
+    return p;
 }
 
-/// Whether `cp`, right after `prev` which a printSliceFast batch just
-/// printed, is eligible to start a printSliceMixed batch: it is of the
-/// other width class than `prev` and eligible exactly as printSliceFast
-/// would require, except that the grapheme break check is against
-/// `prev` rather than the cell to the left of the cursor. Returns the
-/// properties of `prev` for printSliceMixed if so.
-///
-/// That check is exact: a batch only stops before a codepoint of the
-/// other width class at the end of its run (codepoints where it stops
-/// early are of the run's class), so it wrote `prev` as a fresh
-/// single-codepoint cell, and print() compares against the last written
-/// cell (the cursor cell under a pending wrap, the cell to the left
-/// otherwise, resolved through a spacer tail).
-inline fn printSliceTransition(
-    prev: u32,
-    cp: u32,
-    grapheme_cluster: bool,
-    allow_unicode: bool,
-) ?unicode.Properties {
-    if (!allow_unicode) return null;
-    if (cp < 0x10) return null;
-    if (comptime build_options.kitty_graphics) {
-        if (cp == kitty.graphics.unicode.placeholder) return null;
-    }
+/// The codepoints of a row that printSliceClassify found: how many and
+/// the cells they take.
+const PrintSliceRow = struct {
+    n: usize = 0,
+    cells: usize = 0,
 
-    const prev_props = PrintSliceMixedRow.props(prev);
-    const props = PrintSliceMixedRow.props(cp);
-    if (props.width == 0 or props.width == prev_props.width) return null;
-
-    // print() never clusters codepoints up to 0xFF.
-    if (grapheme_cluster and cp > 0xFF) {
-        var state: uucode.grapheme.BreakState = .default;
-        if (!unicode.graphemeBreak(
-            prev_props.grapheme_break,
-            props.grapheme_break,
-            &state,
-        )) return null;
-    }
-
-    return prev_props;
-}
-
-/// The state of printSliceMixed, and its loop over the codepoints that
-/// fit in one row.
-const PrintSliceMixedRow = struct {
-    cps: []const u32,
-
-    /// The narrow cell template (codepoint bits zero).
-    template_bits: u64,
-
-    /// Codepoints consumed.
-    p: usize = 0,
-
-    /// The cells for the row (the row itself, or `buf`), how many fit (up
-    /// to the right limit, at most all of `buf`), and how many we wrote.
-    cells: [*]Cell = undefined,
-    buf: [256]Cell = undefined,
-    avail: usize = 0,
-    k: usize = 0,
-
-    /// How many codepoints of one width class we wrote in a row.
-    same: usize = 0,
-
-    /// The properties of the last codepoint written (see `props`). Its
-    /// grapheme break property is what print() compares the next
-    /// codepoint against under mode 2027, because the last codepoint
-    /// written is always a fresh single-codepoint cell, and its width
-    /// is the class the next codepoint is compared to for `same`.
-    prev: unicode.Properties,
-
-    /// Hand back to printSliceFill after this many codepoints of one
-    /// width class in a row.
-    const homogeneous_max = 32;
-
-    const Stop = enum {
-        /// The next codepoint is eligible but doesn't fit in `avail`.
-        full,
-
-        /// Return to the caller: the end of the slice, a codepoint
-        /// that needs print(), or a homogeneous stretch.
-        done,
-    };
-
-    /// The properties print() uses for a codepoint: those of the table,
-    /// except that codepoints up to 0xFF are always width 1 (print()
-    /// doesn't look them up). This looks up every codepoint so that the
-    /// loop below never branches on the class of a codepoint, which is
-    /// what the mixed-width text it handles makes unpredictable.
-    inline fn props(cp: u32) unicode.Properties {
-        var p = unicode.table.get(@intCast(cp));
-        if (cp <= 0xFF) p.width = 1;
-        return p;
-    }
-
-    /// Fill `cells`. The loop makes no calls and, besides the exits, its
-    /// only branch is on the end of `cells`, which is predictable:
-    /// the codepoint's width class only selects values. Not inlined into
-    /// the row loop so that its values stay in registers rather than
-    /// competing with the row bookkeeping's.
-    fn fill(
-        self: *PrintSliceMixedRow,
-        grapheme_cluster: bool,
-    ) Stop {
-        // Specialized on the mode: whether the break check runs.
-        return if (grapheme_cluster)
-            @call(.never_inline, fillRow, .{ self, true })
-        else
-            @call(.never_inline, fillRow, .{ self, false });
-    }
-
-    fn fillRow(
-        self: *PrintSliceMixedRow,
-        comptime grapheme_cluster: bool,
-    ) Stop {
-        const cp_shift = @bitOffsetOf(Cell, "content");
-        const wide_shift = @bitOffsetOf(Cell, "wide");
-        comptime assert(@backingInt(Cell.Wide.narrow) == 0);
-        comptime assert(@backingInt(Cell.Wide.wide) == 1);
-
-        const cps = self.cps;
-        const cells = self.cells;
-        const avail = self.avail;
-        const template_bits = self.template_bits;
-        const spacer_bits = template_bits |
-            (@as(u64, @backingInt(Cell.Wide.spacer_tail)) << wide_shift);
-        var p = self.p;
-        var k = self.k;
-        var same = self.same;
-        var prev = self.prev;
-        defer {
-            self.p = p;
-            self.k = k;
-            self.same = same;
-            self.prev = prev;
-        }
-
-        while (p < cps.len) {
-            const cp = cps[p];
-            const cur = props(cp);
-            const width: usize = cur.width;
-
-            // Classify the codepoint before deciding anything about the
-            // row: print() decides whether a pending wrap happens only
-            // after looking at it (a grapheme continuation attaches to
-            // the pending cell instead). Bitwise rather than short-
-            // circuit so that no branch depends on the codepoint.
-            var eligible = @intFromBool(cp >= 0x10) & @intFromBool(width != 0);
-            if (comptime build_options.kitty_graphics) {
-                eligible &= @intFromBool(cp != kitty.graphics.unicode.placeholder);
-            }
-            if (comptime grapheme_cluster) {
-                // print() never clusters codepoints up to 0xFF.
-                var brk_state: uucode.grapheme.BreakState = .default;
-                const brk = unicode.graphemeBreak(
-                    prev.grapheme_break,
-                    cur.grapheme_break,
-                    &brk_state,
-                );
-                eligible &= @intFromBool(brk) | @intFromBool(cp <= 0xFF);
-            }
-            if (eligible == 0) return .done;
-            assert(width == 1 or width == 2);
-            if (k + width > avail) return .full;
-
-            // The spacer first: for a narrow codepoint, `last` is `k`
-            // and the codepoint's own cell overwrites it. The wide flag
-            // is the width minus one.
-            const last = k + width - 1;
-            cells[last] = @bitCast(spacer_bits);
-            cells[k] = @bitCast(template_bits |
-                (@as(u64, cp) << cp_shift) |
-                (@as(u64, width - 1) << wide_shift));
-            k += width;
-            p += 1;
-
-            same = if (cur.width == prev.width) same + 1 else 0;
-            prev = cur;
-            if (same >= homogeneous_max) return .done;
-        }
-
-        return .done;
-    }
+    /// Whether printSliceUnicode stops after these: at the end of the
+    /// slice or before a codepoint only print() can print. Otherwise the
+    /// next codepoint, which it can, didn't fit.
+    done: bool = false,
 };
+
+/// The codepoints from the start of `cps` that fit in `avail` cells and
+/// that printSliceUnicode can print, with their widths in `widths`. The
+/// first is one it can print (see printSliceUnicode), and so is each next
+/// one that print() would write to a new cell (see printSliceNext).
+///
+/// Specialized on the mode, whether the break check runs. Not inlined so
+/// that its loop keeps its values in registers.
+fn printSliceClassify(
+    grapheme_cluster: bool,
+    cps: []const u32,
+    avail: usize,
+    widths: *[256]u8,
+) PrintSliceRow {
+    return if (grapheme_cluster)
+        @call(.never_inline, printSliceClassifyMode, .{ true, cps, avail, widths })
+    else
+        @call(.never_inline, printSliceClassifyMode, .{ false, cps, avail, widths });
+}
+
+fn printSliceClassifyMode(
+    comptime grapheme_cluster: bool,
+    cps: []const u32,
+    avail: usize,
+    widths: *[256]u8,
+) PrintSliceRow {
+    var row: PrintSliceRow = .{};
+    var prev = printSliceProps(cps[0]);
+    for (cps, 0..) |cp, n| {
+        const cur = printSliceProps(cp);
+
+        // Check the codepoint before deciding anything about the row:
+        // print() decides whether a pending wrap happens only after
+        // looking at it (a grapheme continuation attaches to the pending
+        // cell instead).
+        if (n > 0 and !printSliceNext(grapheme_cluster, cp, prev, cur)) {
+            row.done = true;
+            return row;
+        }
+
+        const width: usize = cur.width;
+        assert(width == 1 or width == 2);
+        if (row.cells + width > avail) return row;
+
+        widths[n] = @intCast(width);
+        row.n = n + 1;
+        row.cells += width;
+        prev = cur;
+    }
+    row.done = true;
+    return row;
+}
+
+/// Stores the cells of `cps`, of the given `widths`, from `template`
+/// (see printSliceTemplate), with vectors if they are all of one width.
+inline fn printSliceStoreUnicode(
+    cells: [*]Cell,
+    cps: []const u32,
+    widths: []const u8,
+    row: PrintSliceRow,
+    template: Cell,
+) void {
+    const cp_shift = @bitOffsetOf(Cell, "content");
+    const wide_shift = @bitOffsetOf(Cell, "wide");
+    comptime assert(@backingInt(Cell.Wide.narrow) == 0);
+    comptime assert(@backingInt(Cell.Wide.wide) == 1);
+    const template_bits: u64 = @bitCast(template);
+    const wide_bits = template_bits |
+        (@as(u64, @backingInt(Cell.Wide.wide)) << wide_shift);
+    const spacer_bits = template_bits |
+        (@as(u64, @backingInt(Cell.Wide.spacer_tail)) << wide_shift);
+
+    if (row.cells == row.n) {
+        printSliceStoreRun(cells, u32, cps.ptr, 0, row.cells, template_bits, null);
+        return;
+    }
+
+    if (row.cells == 2 * row.n) {
+        // All wide: (wide, spacer_tail) pairs. Manually vectorized for
+        // the same reason as printSliceStoreRun: build a vector of wide
+        // cells, interleave with spacer tails, and store pairs several
+        // at a time.
+        var idx: usize = 0;
+        if (simd.lanes(u64)) |lanes| {
+            const pair_lanes = lanes / 2;
+            const Vp = @Vector(pair_lanes, u64);
+            const wide_v: Vp = @splat(wide_bits);
+            const spacer_v: Vp = @splat(spacer_bits);
+            const shift_v: @Vector(
+                pair_lanes,
+                std.math.Log2Int(u64),
+            ) = @splat(cp_shift);
+            while (idx + lanes <= row.cells) : (idx += lanes) {
+                const narrow: @Vector(pair_lanes, u32) = cps[idx / 2 ..][0..pair_lanes].*;
+                const wides: Vp = wide_v | (@as(Vp, @intCast(narrow)) << shift_v);
+                const pairs: [lanes]u64 = std.simd.interlace(.{ wides, spacer_v });
+                cells[idx..][0..lanes].* = @bitCast(pairs);
+            }
+        }
+        while (idx < row.cells) : (idx += 2) {
+            cells[idx] = @bitCast(wide_bits | (@as(u64, cps[idx / 2]) << cp_shift));
+            cells[idx + 1] = @bitCast(spacer_bits);
+        }
+        return;
+    }
+
+    // Both widths, without branching on them: a wide codepoint's spacer
+    // tail goes to the cell after it first, and a narrow codepoint's own
+    // cell overwrites it in the same place. The wide flag is the width
+    // minus one.
+    var k: usize = 0;
+    for (cps, widths) |cp, width| {
+        cells[k + width - 1] = @bitCast(spacer_bits);
+        cells[k] = @bitCast(template_bits |
+            (@as(u64, cp) << cp_shift) |
+            (@as(u64, width - 1) << wide_shift));
+        k += width;
+    }
+}
 
 pub fn print(self: *Terminal, c: u21) !void {
     // log.debug("print={x} y={} x={}", .{ c, self.screens.active.cursor.y, self.screens.active.cursor.x });
@@ -16071,7 +15778,7 @@ test "Terminal: printSlice charset batched fill" {
     for ([_]sgr.Attribute{ .unset, .unset, .bold, .bold, .unset }) |attr| {
         t.setCursorPos(1, 1);
         try t.setAttribute(attr);
-        try testing.expectEqual(cps.len, try t.printSliceFast(false, u32, &cps, true, false));
+        try testing.expectEqual(cps.len, try t.printSliceFill(false, u32, &cps, true, false));
         const str = try t.plainString(alloc);
         defer alloc.free(str);
         try testing.expectEqualStrings("┌───┐\n└───┘", str);
@@ -16527,7 +16234,7 @@ test "Terminal: printSlice with hyperlink takes the fast path" {
 
     // The batched fill writes the whole run, rather than print().
     const cps = [_]u32{ 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j' };
-    try testing.expectEqual(cps.len, try t.printSliceFast(true, u32, &cps, false, true));
+    try testing.expectEqual(cps.len, try t.printSliceFill(true, u32, &cps, false, true));
 
     // One map entry and one reference per cell, plus the cursor's.
     const page = t.screens.active.cursor.page_pin.node.page();
